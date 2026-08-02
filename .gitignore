@@ -1,0 +1,5 @@
+config/roles.json
+.DS_Store
+__pycache__/
+events/
+*.log
