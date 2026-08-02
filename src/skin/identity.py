@@ -8,7 +8,7 @@ def load_roles() -> dict:
 
 def resolve_role(open_id: str) -> str:
     roles = load_roles()
-    if open_id and open_id == roles.get("boss_open_id"):
+    if open_id in roles.get("boss_open_ids", []):
         return "老板"
     if open_id in roles.get("publisher_open_ids", []):
         return "发片同事"

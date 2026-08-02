@@ -5,7 +5,7 @@ import skin.identity as identity
 class TestIdentity(unittest.TestCase):
     def test_boss(self):
         tmp = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8")
-        json.dump({"boss_open_id": "ou_boss", "publisher_open_ids": ["ou_pub1"]}, tmp)
+        json.dump({"boss_open_ids": ["ou_boss"], "publisher_open_ids": ["ou_pub1"]}, tmp)
         tmp.close()
         old = _ROLES_PATH
         identity._ROLES_PATH = tmp.name
