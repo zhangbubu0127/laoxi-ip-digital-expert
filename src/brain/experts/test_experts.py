@@ -1,8 +1,8 @@
 import unittest
-from base import Expert
-from xiaoti import XiaotiExpert
-from xiaowen import XiaowenExpert
-from xiaone import XiaoneExpert
+from brain.experts.base import Expert
+from brain.experts.xiaoti import XiaotiExpert
+from brain.experts.xiaowen import XiaowenExpert
+from brain.experts.xiaone import XiaoneExpert
 
 class TestExperts(unittest.TestCase):
     def test_xiaoti_returns_typed_topics(self):

@@ -1,5 +1,5 @@
 import unittest, tempfile, os
-import scheduler
+from brain import scheduler
 
 class TestScheduler(unittest.TestCase):
     def setUp(self):

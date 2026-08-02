@@ -1,4 +1,4 @@
-from base import Expert
+from brain.experts.base import Expert
 
 class XiaowenExpert(Expert):
     name = "席小文"

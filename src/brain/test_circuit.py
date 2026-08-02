@@ -1,5 +1,5 @@
 import unittest, tempfile, os
-import circuit
+from brain import circuit
 
 class TestCircuit(unittest.TestCase):
     def test_under_limit(self):

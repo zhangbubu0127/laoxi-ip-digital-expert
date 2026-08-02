@@ -1,4 +1,4 @@
-from base import Expert
+from brain.experts.base import Expert
 
 REDLINES = ["保证录取", "包录取", "国立大学直录", "南洋理工直录", "北大预科"]
 
