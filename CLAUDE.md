@@ -44,9 +44,16 @@ scripts/           辅助脚本
 - 专家：`cd src/brain/experts && python3 test_experts.py`
 - 主控调度：`cd src && python3 -m brain.test_controller`
 
+## LLM 基本盘
+
+- 专家出内容必须走大模型：DeepSeek API，模型 `deepseek-v4-flash`（在 `config/secrets.json` 改）。
+- API key 只放 gitignored 的 `config/secrets.json`，不进代码/commit/日志。
+- 架构：`src/brain/llm.py`（客户端）+ `knowledge.py`（知识库加载）+ 专家「读知识库→拼 prompt→调大模型」。
+- 席小核红线词本地规则拦截先行，再交 LLM 全量审核。
+
 ## 开发顺序
 
-P0 最小闭环：主控调度 + 皮肤收发 + 排期表 + 派单流水线 + 专家三件套（小题/小文/小核）。
+P0 最小闭环：主控调度 + 皮肤收发 + 排期表 + 派单流水线 + 专家三件套（小题/小文/小核，LLM 驱动）。
 P1：席小核外搜核对、席小习 diff 学习、复盘 agent 数据回流。
 P2：圆桌模式、迁多 bot（只换皮肤层）。
 
