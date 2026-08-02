@@ -33,5 +33,18 @@ class TestPipe(unittest.TestCase):
         o = OutboundMessage(chat_id="oc_demo", text="这个事实对吗", agent_tag="席小核", need_boss=True)
         self.assertIn("请老板确认", format_outbound(o))
 
+    def test_parse_inbound_real_schema(self):
+        real = {
+            "id": "om_real_001",
+            "chat_id": "oc_real",
+            "content": "看下排期表",
+            "sender_id": "ou_sender",
+            "mentions": [{"id": "ou_mentioned", "key": "@_user_1", "name": "席小题"}],
+        }
+        m = parse_inbound(real)
+        self.assertEqual(m.message_id, "om_real_001")
+        self.assertEqual(m.sender_open_id, "ou_sender")
+        self.assertEqual(m.mentions, ["@_user_1"])
+
 if __name__ == "__main__":
     unittest.main()

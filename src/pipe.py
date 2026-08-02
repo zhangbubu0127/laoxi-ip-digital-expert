@@ -18,13 +18,16 @@ class OutboundMessage:
 
 def parse_inbound(event: dict) -> InboundMessage:
     sender = event.get("sender") or {}
+    mentions = []
+    for m in event.get("mentions", []):
+        mentions.append(m.get("key") or m.get("id") or "")
     return InboundMessage(
-        message_id=event.get("id", ""),
+        message_id=event.get("id") or event.get("message_id", ""),
         chat_id=event.get("chat_id", ""),
         content=event.get("content", ""),
-        sender_open_id=sender.get("id", ""),
+        sender_open_id=sender.get("id", "") or event.get("sender_id", ""),
         sender_role="未知",
-        mentions=[m.get("key", "") for m in event.get("mentions", [])],
+        mentions=mentions,
     )
 
 def format_outbound(msg: OutboundMessage) -> str:

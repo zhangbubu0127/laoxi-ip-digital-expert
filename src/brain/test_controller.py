@@ -2,6 +2,14 @@ import unittest, tempfile, os
 from pipe import InboundMessage
 from brain.controller import handle_message
 from brain import scheduler
+import brain.controller as controller
+
+class FakeExpert:
+    def __init__(self, text):
+        self.text = text
+
+    def handle(self, task):
+        return self.text
 
 def msg(content, role="老板", mid="m1"):
     return InboundMessage(message_id=mid, chat_id="oc_t", content=content,
@@ -16,6 +24,9 @@ class TestController(unittest.TestCase):
         tmp.close()
         self.path = tmp.name
         scheduler._SCHEDULE_PATH = self.path
+        controller.XiaotiExpert = lambda: FakeExpert("【测试】3个选题")
+        controller.XiaowenExpert = lambda: FakeExpert("【测试】脚本 v1")
+        controller.XiaoneExpert = lambda: FakeExpert("✅ 通过：无红线，可进入发布流程。")
 
     def tearDown(self):
         os.unlink(self.path)
