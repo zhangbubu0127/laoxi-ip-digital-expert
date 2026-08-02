@@ -46,6 +46,10 @@ class TestController(unittest.TestCase):
         out = handle_message(msg("下周三要3条曝光"))
         self.assertTrue(any("3条" in m.text for m in out))
 
+    def test_product_has_boss_permission(self):
+        out = handle_message(msg("帮我出3个选题", role="产品"))
+        self.assertTrue(any("席小题" in m.agent_tag for m in out))
+
     def test_fallback(self):
         out = handle_message(msg("今天天气不错"))
         self.assertTrue(any("需要我做什么" in m.text for m in out))

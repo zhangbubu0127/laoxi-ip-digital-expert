@@ -19,16 +19,16 @@ def handle_message(msg: InboundMessage) -> list[OutboundMessage]:
         return replies
 
     if "已发布" in content:
-        if role == "老板" or role == "发片同事":
+        if _is_admin(role) or role == "发片同事":
             ok = _try_mark_published(content)
             replies.append(OutboundMessage(msg.chat_id, f"已发状态：{ok}", "主控调度"))
         else:
-            replies.append(OutboundMessage(msg.chat_id, "无权限：只有发片同事或老板能确认已发布", "主控调度"))
+            replies.append(OutboundMessage(msg.chat_id, "无权限：只有老板、产品或发片同事能确认已发布", "主控调度"))
         return replies
 
-    if role != "老板":
+    if not _is_admin(role):
         if _looks_like_command(content):
-            replies.append(OutboundMessage(msg.chat_id, "无权限：只有老板能派单或改排期", "主控调度"))
+            replies.append(OutboundMessage(msg.chat_id, "无权限：只有老板或产品能派单或改排期", "主控调度"))
             return replies
         if role == "未知" and "排期表" in content:
             replies.append(OutboundMessage(msg.chat_id, "无权限：当前身份未识别", "主控调度"))
@@ -50,6 +50,9 @@ def handle_message(msg: InboundMessage) -> list[OutboundMessage]:
     else:
         replies.append(OutboundMessage(msg.chat_id, "需要我做什么？出选题/写脚本/看排期/讨论？", "主控调度"))
     return replies
+
+def _is_admin(role: str) -> bool:
+    return role == "老板" or role == "产品"
 
 def _looks_like_command(content: str) -> bool:
     return any(k in content for k in ["选题", "脚本", "排期表", "3条曝光"])
