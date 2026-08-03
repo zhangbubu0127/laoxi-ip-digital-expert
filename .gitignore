@@ -1,6 +1,12 @@
 config/roles.json
 config/secrets.json
+config/bots.json
+config/base.json
+workspace/上下文/
+memory/token账本.md
 .DS_Store
 __pycache__/
 events/
+logs/
 *.log
+src/testevt*/
