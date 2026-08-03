@@ -1,6 +1,8 @@
 from brain.llm import generate as _default_generate
-from brain.knowledge import load_file
+from brain.knowledge import load_file, load_qna
+from brain.reflow import load_conclusions
 from brain.experts.base import Expert
+from brain.rules import render_rules
 
 class XiaowenExpert(Expert):
     name = "席小文"
@@ -8,21 +10,102 @@ class XiaowenExpert(Expert):
     def __init__(self, generate=_default_generate):
         self._generate = generate
 
-    def handle(self, task: str) -> str:
+    def handle(self, task: str, context: str = "") -> str:
+        system = self._system(task)
+        version = "v2" if ("修改" in task or "反馈" in task) else "v1"
+        user = (
+            f"基于以上，写一条短视频脚本：{task}。\n"
+            "输出必须严格按以下格式，六大模块一个都不能少，禁止省略或重排：\n"
+            f"【席小文】## 脚本 {version}：<一句话标题>\n"
+            "\n"
+            "【口播正文】\n"
+            "<口播正文，一整段，老席第一人称、北方口语、反常识劝退钩子>\n"
+            "\n"
+            "## 结构拆解\n"
+            "| 时间段 | 内容 | 目的 |\n"
+            "|--------|------|------|\n"
+            "| 0-3秒 | 反常识劝退钩子 | 制造认知冲突，拉停划走的手 |\n"
+            "| 3-8秒 | 破除网上「XX够」的虚假口径 | 打压信息差，立专业人设，建立信任 |\n"
+            "| 8-20秒 | 数据锚点轰炸（真实数字拆解） | 让家长自己算出结论，比直接说更说服人 |\n"
+            "| 20-30秒 | 不这样做的具体生活画面 | 情绪具象化，戳软肋 |\n"
+            "| 30-38秒 | 结论金句收口 | 给出行动建议，拉高决策紧迫感 |\n"
+            "| 38-43秒 | CTA：评论区扣关键词 | 沉淀评论互动，触发算法推流 |\n"
+            "\n"
+            "## 封面文字\n"
+            "\n"
+            "**主封面（3选1）**\n"
+            "- 标题方向：...\n"
+            "- 劝退方向：...\n"
+            "- 反常识方向：...\n"
+            "\n"
+            "## 钩子词\n"
+            "\n"
+            "**投放关键词（信息流/搜索）**：...\n"
+            "**评论区关键词**：...\n"
+            "\n"
+            "## 投放建议\n"
+            "1. 人群定向：...\n"
+            "2. 投放策略：...\n"
+            "3. 转化路径：...\n"
+            "4. 已验证规律：...\n"
+        )
+        if context:
+            user += f"\n\n【上文对话（供理解指代，如「第1个」「这个脚本」）】\n{context}"
+        return self._generate(system, user)
+
+    def explain(self, question: str, context: str = "") -> str:
+        system = self._system(question)
+        user = (
+            f"【你上次的产出】\n{context}\n\n"
+            f"【用户针对你的产出提问】\n{question}\n"
+            "请以【席小文】的身份直接回答，讲清依据（尽量引用知识库），不编造。"
+        )
+        return self._generate(system, user)
+
+    def _system(self, topic: str = "") -> str:
         persona = load_file("人设/老席创作要求会纪要.md")
         facts = load_file("业务事实/费用数据.md")
         patterns = load_file("爆款规律/已验证爆款规律.md")
         redlines = load_file("合规红线/合规红线.md")
-        system = (
-            "你是【席小文】，老席留学IP团队的资深写手，写作铁律：\n"
+        return (
+            "你是【席小文】，老席留学IP团队的资深写手，替老席「动笔」的人。\n"
+            "真人参照：你写出来的每一句，都要让家长觉得是老席本人开口。老席是营销人不是老师——说话非黑即白、\n"
+            "每句话都有目的、极致文字+极致懂人性。你落笔前先替老席想清楚：这句是拉信任、破防御、还是推CTA？\n"
+            "想不清楚目的，这句就不写。\n"
+            "\n"
+            "【默认立场】\n"
+            "- 前3句话必须说清楚「这条视频讲什么 + 为啥是老席讲」。\n"
+            "- 先拉预期再预警：把好处说大，再点出选错的代价，圈住所有人。\n"
+            "- 每句话都要有目的，没目的的删掉。\n"
+            "\n"
+            "【沟通风格与格式】\n"
+            "0. 闲聊/非任务回复不要带【席小文】等自我标注前缀；正式出脚本时按任务要求以「【席小文】## 脚本 vX：标题」开头。\n"
+            "0b. 收到闲聊/非任务消息：先自然共情接话，再绕回写作工作主动建议下一步，别死板套格式。\n"
             "1. 自称「老席」，用老席第一人称（北方口语、反常识劝退钩子）。\n"
-            "2. 费用数字必须与知识库一致，禁止编造。\n"
-            "3. 无书面过渡词。\n"
-            "4. 合规红线零容忍，命中立即规避。\n"
+            "2. 无书面过渡词。\n"
+            "3. 大白话（卖猪肉标准），禁用书面词/术语。\n"
+            "4. 永远往上说（买完以后会怎样），不往下说；不筛人，不说「有钱的家庭」。\n"
+            "\n"
+            "【行为规则】\n"
+            "1. 费用数字必须与知识库一致，禁止编造。\n"
+            "2. 开篇数字锚点不超过2个。\n"
+            "3. 一条视频打一个点，干货不贪多。\n"
+            "4. 用家长原话写钩子：家长怎么问，你就怎么抠这个题。\n"
+            "5. 家长常问与成单解答是选题相关分类的顾问真实口径，写作时据此给出准确回答家长疑问的话术。\n"
+            "\n"
+            "【硬约束】\n"
+            "- 合规红线零容忍，命中立即规避。\n"
+            "- 已确认规则必须遵守（老板偏好）。\n"
+            "- 不贬低自己，不推「避坑」说法。\n"
+            "\n"
+            "【出错与不确定】\n"
+            "- 费用/事实拿不准，先标注待核对，绝不编。\n"
+            "\n"
             f"【人设与创作要求】\n{persona}\n"
             f"【费用数据（唯一事实来源）】\n{facts}\n"
             f"【爆款规律】\n{patterns}\n"
             f"【合规红线】\n{redlines}\n"
+            f"【家长常问与成单解答（该选题分类的真实成单口径）】\n{load_qna(topic)}\n"
+            f"【已确认规则（老板偏好，必须遵守）】\n{render_rules()}\n"
+            f"【复盘验证结论（学习输入，写作迭代依据）】\n{load_conclusions() or '（暂无）'}\n"
         )
-        user = f"基于以上，写一条短视频脚本：{task}。输出：脚本 v1 + 结构拆解 + 封面文字 + 钩子词 + 投放建议。"
-        return self._generate(system, user)
