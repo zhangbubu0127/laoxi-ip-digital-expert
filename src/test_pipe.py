@@ -25,9 +25,9 @@ class TestPipe(unittest.TestCase):
         m = parse_inbound(e)
         self.assertEqual(m.sender_open_id, "")
 
-    def test_format_outbound_tag(self):
+    def test_format_outbound_no_tag(self):
         o = OutboundMessage(chat_id="oc_demo", text="推荐3个选题", agent_tag="席小题")
-        self.assertEqual(format_outbound(o), "【席小题】推荐3个选题")
+        self.assertEqual(format_outbound(o), "推荐3个选题")
 
     def test_format_outbound_boss_flag(self):
         o = OutboundMessage(chat_id="oc_demo", text="这个事实对吗", agent_tag="席小核", need_boss=True)
@@ -44,7 +44,7 @@ class TestPipe(unittest.TestCase):
         m = parse_inbound(real)
         self.assertEqual(m.message_id, "om_real_001")
         self.assertEqual(m.sender_open_id, "ou_sender")
-        self.assertEqual(m.mentions, ["@_user_1"])
+        self.assertEqual(m.mentions, ["ou_mentioned"])
 
 if __name__ == "__main__":
     unittest.main()
