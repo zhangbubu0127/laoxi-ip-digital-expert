@@ -1,8 +1,9 @@
 import unittest, tempfile
+from unittest import mock
 from brain.experts.base import Expert
 from brain.experts.xiaoti import XiaotiExpert
 from brain.experts.xiaowen import XiaowenExpert
-from brain.experts.xiaone import XiaoneExpert
+from brain.experts.xiaone import XiaoneExpert, split_review
 from brain.experts.xiaoxi import XiaoxiExpert
 from brain import material
 
@@ -10,7 +11,7 @@ class FakeGen:
     def __init__(self):
         self.calls = []
 
-    def __call__(self, system, user):
+    def __call__(self, system, user, **kwargs):
         self.calls.append((system, user))
         return "【测试】生成结果"
 
@@ -19,7 +20,7 @@ class FakeGenReturn:
         self.text = text
         self.calls = []
 
-    def __call__(self, system, user):
+    def __call__(self, system, user, **kwargs):
         self.calls.append((system, user))
         return self.text
 
@@ -44,12 +45,59 @@ class TestExperts(unittest.TestCase):
         verdict = XiaoneExpert(generate=FakeGen()).handle(bad)
         self.assertIn("红线", verdict)
 
+    def test_xiaone_redline_in_context_also_rejected(self):
+        # 问题2：脚本放 context（后台），红线扫描必须覆盖 context 而非只扫 task
+        verdict = XiaoneExpert(generate=FakeGen()).handle("审核这条脚本", context="包录取，直接上国立")
+        self.assertIn("红线", verdict)
+
+    def test_xiaone_split_review(self):
+        text = ("【审核结论】通过\n需要给您展示理由吗？\n\n===审核详情===\n"
+                "费用数字与知识库一致，无红线。")
+        public, details = split_review(text)
+        self.assertIn("【审核结论】通过", public)
+        self.assertIn("需要给您展示理由吗？", public)
+        self.assertIn("费用数字与知识库一致", details)
+        self.assertNotIn("===审核详情===", details)
+
+    def test_xiaone_split_review_strips_json(self):
+        text = ("【审核结论】通过\n需要给您展示理由吗？\n\n===审核详情===\n"
+                "费用数字与知识库一致。\n{\"claims\":[{\"fact\":\"新加坡国立大学\"}]}")
+        public, details = split_review(text)
+        self.assertNotIn("claims", details)
+        self.assertNotIn("{", details)
+
+    def test_xiaone_fail_reply_splits_clean(self):
+        # 本地红线拒稿输出也要双段：公开段只给结论+问理由，详情段存后台
+        text = XiaoneExpert(generate=FakeGen()).handle("包录取")
+        public, details = split_review(text)
+        self.assertIn("【审核结论】不通过", public)
+        self.assertIn("需要给您展示理由吗？", public)
+        self.assertIn("合规红线", details)
+
     def test_xiaone_passes_clean_via_llm(self):
         fg = FakeGen()
         good = "新加坡留学，老席帮你算笔账"
         verdict = XiaoneExpert(generate=fg).handle(good)
         self.assertIn("测试", verdict)
         self.assertEqual(len(fg.calls), 1)
+
+    def test_xiaowen_prompt_discourages_over_reasoning(self):
+        fg = FakeGen()
+        XiaowenExpert(generate=fg).handle("写条脚本，关于预算对比")
+        self.assertIn("不要展开长篇推理过程", fg.calls[0][0])
+
+    def test_xiaone_prompt_discourages_over_reasoning(self):
+        fg = FakeGen()
+        XiaoneExpert(generate=fg).handle("新加坡留学，老席帮你算笔账")
+        self.assertIn("不要展示内心推理草稿", fg.calls[0][0])
+
+    def test_xiaone_prompt_details_mandatory(self):
+        # 审核详情段是必须交付的存档内容，不是可省的推理过程（否则老板要理由时无档可读）
+        fg = FakeGen()
+        XiaoneExpert(generate=fg).handle("新加坡留学，老席帮你算笔账")
+        system = fg.calls[0][0]
+        self.assertIn("必须交付", system)
+        self.assertIn("必须写完", system)
 
     def test_xiaowen_prompt_has_confirmed_rules(self):
         fg = FakeGen()
@@ -137,6 +185,31 @@ class TestExperts(unittest.TestCase):
         system = fg.calls[0][0]
         self.assertIn("已确认规则", system)
         self.assertIn("复盘验证结论", system)
+
+    def test_xiaoti_prompt_includes_market_intel(self):
+        with mock.patch("brain.experts.xiaoti.market_intel", return_value="【竞对】新东方前途文书模板化（测试）"):
+            fg = FakeGen()
+            XiaotiExpert(generate=fg).handle("帮我出3个选题")
+        system = fg.calls[0][0]
+        self.assertIn("竞对情报/市场热点", system)
+        self.assertIn("新东方前途文书模板化", system)
+
+    def test_xiaoti_quota_half_market_half_local(self):
+        fg = FakeGen()
+        XiaotiExpert(generate=fg).handle("帮我出10个选题")
+        user = fg.calls[0][1]
+        self.assertIn("取材配额", user)
+        self.assertIn("一半取材于【竞对情报/市场热点】", user)
+        self.assertIn("另一半取材于本地知识库", user)
+        self.assertIn("禁止全部来自单一来源", user)
+        self.assertIn("标注取材来源", user)
+
+    def test_xiaoti_quota_no_count_still_instructs_split(self):
+        fg = FakeGen()
+        XiaotiExpert(generate=fg).handle("出几个选题")
+        user = fg.calls[0][1]
+        self.assertIn("取材配额", user)
+        self.assertNotIn("本批约", user)
 
     def test_xiaone_prompt_has_confirmed_rules(self):
         fg = FakeGen()

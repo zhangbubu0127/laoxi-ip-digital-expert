@@ -91,10 +91,20 @@ class TestRecognize(unittest.TestCase):
         r = recognize("看完整讨论", generate=fg)
         self.assertEqual(r.intent, "看完整讨论")
 
+    def test_lookup_record_intent(self):
+        fg = FakeGen('{"intent":"查记录"}')
+        r = recognize("刚才的选题你还能看见么", generate=fg)
+        self.assertEqual(r.intent, "查记录")
+
     def test_roundtable_intent(self):
         fg = FakeGen('{"intent":"圆桌讨论"}')
         r = recognize("开圆桌会议", generate=fg)
         self.assertEqual(r.intent, "圆桌讨论")
+
+    def test_review_script_intent(self):
+        fg = FakeGen('{"intent":"审核脚本"}')
+        r = recognize("审核一下", generate=fg)
+        self.assertEqual(r.intent, "审核脚本")
 
 class TestByKeyword(unittest.TestCase):
     def test_topic_synonym(self):
@@ -105,6 +115,12 @@ class TestByKeyword(unittest.TestCase):
         r = by_keyword("下周三要3条曝光")
         self.assertEqual(r.intent, "改排期")
         self.assertEqual(r.params["count"], "3")
+
+    def test_confirm_passed_topic_synonym(self):
+        # 老板确认刚定稿选题后要求上传/排期 → 改排期（不被「出选题」/「写脚本」吸走）
+        self.assertEqual(by_keyword("这条选题通过了，把类型和选题都上传").intent, "改排期")
+        self.assertEqual(by_keyword("那可以排期发布了").intent, "改排期")
+        self.assertEqual(by_keyword("这条选题通过了，把类型上传").intent, "改排期")
 
     def test_revise_synonym(self):
         self.assertEqual(by_keyword("这个脚本不行，把开头改掉").intent, "反馈修改")
@@ -127,8 +143,40 @@ class TestByKeyword(unittest.TestCase):
         self.assertEqual(by_keyword("大家讨论下第二条选题").intent, "圆桌讨论")
         self.assertEqual(by_keyword("关于预算对比开个圆桌").intent, "圆桌讨论")
 
+    def test_write_script_synonym(self):
+        self.assertEqual(by_keyword("根据这个出内容吧").intent, "写脚本")
+        self.assertEqual(by_keyword("按这个出").intent, "写脚本")
+        self.assertEqual(by_keyword("出个60秒文案").intent, "写脚本")
+        self.assertEqual(by_keyword("写条脚本").intent, "写脚本")
+
     def test_published(self):
         self.assertEqual(by_keyword("8/3普娃逆袭已发布").intent, "确认已发布")
+
+    def test_review_script_synonym(self):
+        self.assertEqual(by_keyword("审核一下").intent, "审核脚本")
+        self.assertEqual(by_keyword("刚刚生成的文案，审核一下").intent, "审核脚本")
+        self.assertEqual(by_keyword("这条脚本审审").intent, "审核脚本")
+        self.assertEqual(by_keyword("复审一下").intent, "审核脚本")
+
+    def test_market_intel_synonym(self):
+        self.assertEqual(by_keyword("更新情报").intent, "更新市场情报")
+        self.assertEqual(by_keyword("刷新市场情报").intent, "更新市场情报")
+        self.assertEqual(by_keyword("搜竞对").intent, "更新市场情报")
+        self.assertEqual(by_keyword("现在什么话题热").intent, "更新市场情报")
+
+    def test_lookup_record_synonym(self):
+        # 「查记录」兜底：老板问历史产出还在不在/在哪（含「能看见」口语变体）
+        self.assertEqual(by_keyword("刚才的选题你还能看见么").intent, "查记录")
+        self.assertEqual(by_keyword("刚才的选题还能看到么").intent, "查记录")
+        self.assertEqual(by_keyword("上次出的选题在哪").intent, "查记录")
+        self.assertEqual(by_keyword("刚才那个脚本还在吗").intent, "查记录")
+        self.assertEqual(by_keyword("选题找不回来了").intent, "查记录")
+
+    def test_lookup_record_not_shadow_other_intents(self):
+        # 别误伤：带「选题」但不带回顾性动词的，仍是原意图
+        self.assertNotEqual(by_keyword("把刚才那个选题写条脚本").intent, "查记录")
+        self.assertEqual(by_keyword("把第一条选题排上").intent, "改排期")
+        self.assertEqual(by_keyword("这条选题通过了，把类型和选题都上传").intent, "改排期")
 
     def test_chitchat(self):
         self.assertEqual(by_keyword("今天天气不错").intent, "其他")

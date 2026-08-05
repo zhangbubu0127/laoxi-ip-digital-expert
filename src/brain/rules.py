@@ -34,6 +34,18 @@ def add_rule(change: str, rule: str, level: str = "L1") -> str:
     _log.info("规则待确认 %s: %s", rid, rule[:40])
     return rid
 
+def add_confirmed_rule(change: str, rule: str, level: str = "L1") -> str:
+    # 老板答复审核疑问给的确定答案：本身就是确认动作，直接落「已确认」，席小核/席小文下次产出生效
+    rows = load_rules()
+    rid = f"rule_{len(rows) + 1:04d}"
+    rows.append({
+        "id": rid, "change": _clean(change), "rule": _clean(rule),
+        "level": level, "status": "已确认", "time": _today(),
+    })
+    _rewrite(rows)
+    _log.info("规则已确认 %s: %s", rid, rule[:40])
+    return rid
+
 def confirm_pending(confirm: bool = True) -> int:
     rows = load_rules()
     n = 0

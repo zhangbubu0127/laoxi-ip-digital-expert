@@ -5,6 +5,7 @@ from pipe import parse_inbound
 from skin import lark_bridge
 from skin.bots import by_role
 from brain.experts.dispatch import run_expert
+from brain.experts.xiaone import split_review
 from brain import context_store
 
 log = get_logger("multi_main", console=True)
@@ -48,6 +49,12 @@ def _run_expert(role: str, entry: dict) -> None:
                         log.info("%s 回依据（LLM 重释） chat=%s", role, msg.chat_id)
                         continue
                     text = run_expert(role, task, context)
+                    if role == "席小核":
+                        # 双段输出：公开发结论，详情存档（老板要理由才展示），避免刷屏
+                        public, details = split_review(text)
+                        if details:
+                            context_store.save_review(msg.chat_id, role, details)
+                        text = public
                     if role == "席小题" and "【依据】" in text:
                         if "圆桌" in task:
                             lark_bridge.send_reply(msg.chat_id, text, profile)
@@ -95,26 +102,36 @@ def _split_topic_output(text: str):
 
 
 def _basis_request(role: str, task: str) -> bool:
+    # 老板口语多变（"看看"/"讲下理由"/"凭啥"），只要席小题被追问就尝试读依据存档，命中即按题回
     if role != "席小题" or not task:
         return False
-    if task.startswith("【追问】") or task.startswith("老板在群里直接找你聊"):
-        return "依据" in task
-    return False
+    return task.startswith("【追问】") or task.startswith("老板在群里直接找你聊")
 
+
+_CN_NUM = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+
+def _match_index(task: str):
+    # 老板说「第2个/选题三」等指代 → 取序号，返回 int；没有返回 None
+    m = re.search(r"(?:第|选题)\s*([\d一二两三四五六七八九十]+)\s*[个条只]?", task)
+    if not m:
+        return None
+    raw = m.group(1)
+    return int(raw) if raw.isdigit() else _CN_NUM.get(raw, 0)
 
 def _match_basis_question(task: str, topics: str, basis: str) -> str:
     pairs = list(_paired_topics(topics, basis))
     if not pairs:
         return basis
-    m = re.search(r"第\s*(\d+)\s*[个条只]", task)
-    if m:
-        n = int(m.group(1))
+    n = _match_index(task)
+    if n:
         for num, topic, reason in pairs:
             if num == n:
-                return f"选题{n}「{_strip_type(topic)}」的依据：{reason}"
+                # 选题名与依据分两行，避免一长句糊在一起
+                return f"选题{n}「{_strip_type(topic)}」\n依据：{reason}"
         return f"没找到第 {n} 个选题的依据。"
-    lines = [f"选题{num}「{_strip_type(topic)}」的依据：{reason}" for num, topic, reason in pairs]
-    return "\n".join(lines)
+    # 每个选题+依据独立成块，块间空行分隔，观感清爽
+    blocks = [f"选题{num}「{_strip_type(topic)}」\n依据：{reason}" for num, topic, reason in pairs]
+    return "\n\n".join(blocks)
 
 
 def _paired_topics(topics: str, basis: str):

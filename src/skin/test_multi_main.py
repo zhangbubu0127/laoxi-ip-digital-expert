@@ -23,6 +23,7 @@ class TestMultiMain(unittest.TestCase):
 
     def test_basis_request_only_when_explaining(self):
         self.assertTrue(_basis_request("席小题", "【追问】依据是什么"))
+        self.assertTrue(_basis_request("席小题", "【追问】看看"))
         self.assertTrue(_basis_request("席小题", "老板在群里直接找你聊：看依据"))
         self.assertFalse(_basis_request("席小题", "出3个有依据的选题"))
         self.assertFalse(_basis_request("席小文", "【追问】依据是什么"))
@@ -53,6 +54,14 @@ class TestMultiMain(unittest.TestCase):
         out = _match_basis_question("看依据", topics, basis)
         self.assertIn("选题1", out)
         self.assertIn("选题2", out)
+
+    def test_match_basis_layout_blank_line_between_blocks(self):
+        topics = "1.【信任】野鸡大学回应\n2.【信任】19岁硕士毕业"
+        basis = "1. 家长原话五星\n2. 爆款规律跑过"
+        out = _match_basis_question("看依据", topics, basis)
+        self.assertIn("\n\n", out)  # 块间空行分隔
+        self.assertIn("\n依据：家长原话五星", out)  # 选题与依据分行
+        self.assertNotIn("选题1「野鸡大学回应」依据", out)  # 不糊成一长句
 
     def test_match_basis_drift_pairs_by_number(self):
         topics = "1.选题甲\n2.选题乙"

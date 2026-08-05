@@ -31,6 +31,8 @@ def run_expert(role: str, task: str, context: str = "", factories=None) -> str:
             return fac["席小文"]().explain(task[len(EXPLAIN_MARK):].strip(), context=context)
         return fac["席小文"]().handle(task, context=context)
     if role == "席小核":
+        if task.startswith(EXPLAIN_MARK):
+            return fac["席小核"]().explain(task[len(EXPLAIN_MARK):].strip(), context=context)
         return fac["席小核"]().handle(task, context=context)
     if role == "席小习":
         return learn_rules_flow(_strip_mark(task), context, fac)

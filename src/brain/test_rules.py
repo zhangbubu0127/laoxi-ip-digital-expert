@@ -46,5 +46,12 @@ class TestRules(unittest.TestCase):
         self.assertNotIn("|", row["change"])
         self.assertNotIn("|", row["rule"])
 
+    def test_add_confirmed(self):
+        rid = rules.add_confirmed_rule("老板确认审核疑问", "费用按8万算没问题")
+        self.assertIn("rule_0001", rid)
+        self.assertFalse(rules.has_pending())
+        self.assertEqual(len(rules.confirmed_rules()), 1)
+        self.assertIn("费用按8万算没问题", rules.render_rules())
+
 if __name__ == "__main__":
     unittest.main()

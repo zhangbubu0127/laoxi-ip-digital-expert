@@ -13,12 +13,12 @@ def load_secrets() -> dict:
 def generate(system: str, user: str, max_tokens: int = 8000, temperature: float = 0.8) -> str:
     secrets = load_secrets()
 
-    def _request(mt: int) -> urllib.request.Request:
+    def _request(mt: int, user_msg: str = None) -> urllib.request.Request:
         payload = {
             "model": secrets["model"],
             "messages": [
                 {"role": "system", "content": system},
-                {"role": "user", "content": user},
+                {"role": "user", "content": user_msg or user},
             ],
             "max_tokens": mt,
             "temperature": temperature,
@@ -58,13 +58,14 @@ def generate(system: str, user: str, max_tokens: int = 8000, temperature: float 
         if finish == "length":
             raise RuntimeError(f"LLM 输出被截断（finish_reason=length, usage={usage}），需增大 max_tokens")
         return content
-    # 空内容（含 reasoning 吃满 max_tokens、只剩推理无正文）：逐步加大预算重试
-    _log.warning("LLM 空输出（finish=%s usage=%s），加大 max_tokens 重试", finish, usage)
-    for attempt in range(3):
+    # 空内容（多为推理模型 thinking 吃满预算只剩推理无正文）：带「直接输出」提示限时重试
+    nudged = user + "\n\n【系统】上一次回答因推理过程占满输出预算、正文为空。请立刻直接输出最终答案正文，不要再展开任何推理。"
+    _log.warning("LLM 空输出（finish=%s usage=%s），带提示重试", finish, usage)
+    for attempt in range(2):
         time.sleep(2 * (attempt + 1))
-        mt = min(max_tokens * (attempt + 2), 16000)
+        mt = min(max_tokens + 4000 * (attempt + 1), 16000)
         try:
-            with urllib.request.urlopen(_request(mt), timeout=180) as resp:
+            with urllib.request.urlopen(_request(mt, nudged), timeout=120) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
             choice = data["choices"][0]
             content = choice["message"]["content"]

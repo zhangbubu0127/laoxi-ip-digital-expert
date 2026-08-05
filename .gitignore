@@ -10,3 +10,10 @@ events/
 logs/
 *.log
 src/testevt*/
+
+# 新加坡热点雷达（radar/）机器本地物与密钥，不入库
+radar/.venv/
+radar/scrapers/.douyin_profile/
+radar/config.json
+radar/feishu_auth_qr.png
+radar/output/

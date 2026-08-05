@@ -20,8 +20,10 @@ def put(chat_id: str, role: str, task: str, context: str) -> str:
 def take(chat_id: str, role: str):
     _ensure_dir()
     prefix = f"{chat_id}_{role}_"
+    # basis/review 文件也以 {chat_id}_{role}_ 开头，但它们是存档不是派单上下文，取走即删会吃掉存档
     candidates = [os.path.join(_DIR, n) for n in os.listdir(_DIR)
-                  if n.startswith(prefix) and n.endswith(".json")]
+                  if n.startswith(prefix) and n.endswith(".json")
+                  and not n.endswith("_basis.json") and not n.endswith("_review.json")]
     if not candidates:
         return None
     path = max(candidates, key=os.path.getmtime)
@@ -38,6 +40,9 @@ def sweep(older_than: float = 600.0) -> None:
     _ensure_dir()
     now = time.time()
     for n in os.listdir(_DIR):
+        if n.endswith("_basis.json") or n.endswith("_review.json"):
+            # 存档（选题清单/审核详情）是固定记录，覆盖写有界，不能随临时派单上下文一起清掉
+            continue
         path = os.path.join(_DIR, n)
         try:
             if now - os.path.getmtime(path) > older_than:
@@ -60,3 +65,18 @@ def load_basis(chat_id: str, role: str):
         return data.get("topics", ""), data.get("basis", "")
     except (OSError, json.JSONDecodeError):
         return "", ""
+
+
+def save_review(chat_id: str, role: str, details: str) -> None:
+    _ensure_dir()
+    with open(os.path.join(_DIR, f"{chat_id}_{role}_review.json"), "w", encoding="utf-8") as f:
+        json.dump({"details": details, "ts": time.time()}, f, ensure_ascii=False)
+
+
+def load_review(chat_id: str, role: str) -> str:
+    path = os.path.join(_DIR, f"{chat_id}_{role}_review.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f).get("details", "")
+    except (OSError, json.JSONDecodeError):
+        return ""
