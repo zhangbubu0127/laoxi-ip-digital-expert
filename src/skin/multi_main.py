@@ -136,9 +136,28 @@ def _match_basis_question(task: str, topics: str, basis: str) -> str:
 
 def _paired_topics(topics: str, basis: str):
     tmap = _numbered_lines(topics)
-    bmap = _numbered_lines(basis)
+    bmap = _basis_map(basis)
     for k in sorted(set(tmap) | set(bmap)):
         yield k, tmap.get(k, "（未给出题目）"), bmap.get(k, "（未给出依据）")
+
+
+def _basis_map(basis: str) -> dict:
+    # 兼容两种依据格式：旧「N. 依据」单行；新「（选题N依据，来源：…）\n依据段落」块状（LLM 自然飘出，未锁死行格式）
+    if not basis:
+        return {}
+    out = {}
+    blocks = re.split(r"（\s*选题\s*(\d+)\s*依据[^）]*）", basis)
+    if len(blocks) > 1:
+        for i in range(1, len(blocks), 2):
+            if i + 1 < len(blocks):
+                out[int(blocks[i])] = blocks[i + 1].strip()
+        if out:
+            return out
+    for line in (basis or "").splitlines():
+        m = re.match(r"^\s*(\d+)\s*[.、.．]\s*(.*?)\s*$", line)
+        if m:
+            out[int(m.group(1))] = m.group(2).strip()
+    return out
 
 
 def _numbered_lines(text: str) -> dict:

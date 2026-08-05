@@ -75,6 +75,29 @@ class TestMultiMain(unittest.TestCase):
         out = _match_basis_question("第5个的依据", "1.甲\n2.乙", "1.依据甲\n2.依据乙")
         self.assertIn("没找到", out)
 
+    def test_match_basis_new_block_format(self):
+        # LLM 飘出的块状格式：每条依据以（选题N依据，来源：…）开头、正文成段，解析器需配对
+        topics = "1.【信任】野鸡大学回应\n2.【曝光】19岁硕士毕业"
+        basis = ("（选题1依据，来源：市场热点+知识库）\n家长原话里最高频的是安全焦虑，这条打信任。\n\n"
+                 "（选题2依据，来源：市场热点+知识库）\n这条对准反内卷家长，反常识劝退有争议能拉曝光。")
+        out = _match_basis_question("看依据", topics, basis)
+        self.assertIn("选题1", out)
+        self.assertIn("家长原话里最高频的是安全焦虑", out)
+        self.assertIn("选题2", out)
+        self.assertIn("反常识劝退有争议能拉曝光", out)
+        self.assertNotIn("未给出依据", out)
+
+    def test_match_basis_new_block_format_specific_number(self):
+        topics = "1.【信任】野鸡大学回应\n2.【曝光】19岁硕士毕业"
+        basis = ("（选题1依据，来源：市场热点+知识库）\n家长原话安全焦虑。\n\n"
+                 "（选题2依据，来源：市场热点+知识库）\n反内卷家长，反常识劝退。")
+        out = _match_basis_question("第2个的依据", topics, basis)
+        self.assertIn("选题2", out)
+        self.assertIn("19岁硕士毕业", out)
+        self.assertIn("反内卷家长，反常识劝退", out)
+        self.assertNotIn("野鸡大学", out)
+        self.assertNotIn("未给出依据", out)
+
 
 if __name__ == "__main__":
     unittest.main()
