@@ -64,5 +64,20 @@ class TestLoadQna(unittest.TestCase):
         finally:
             tmp.cleanup()
 
+class TestStyle(unittest.TestCase):
+    def test_style_users_has_default(self):
+        self.assertIn("老席", knowledge.style_users())
+
+    def test_load_style_default_returns_content(self):
+        text = knowledge.load_style("老席")
+        self.assertTrue(len(text) > 100)
+
+    def test_load_style_fallback_unknown_user(self):
+        # 未知风格用户 → 回落老席，绝不空
+        self.assertEqual(knowledge.load_style("不存在的用户"), knowledge.load_style("老席"))
+
+    def test_load_style_empty_falls_back_default(self):
+        self.assertEqual(knowledge.load_style(""), knowledge.load_style("老席"))
+
 if __name__ == "__main__":
     unittest.main()

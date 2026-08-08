@@ -1,10 +1,10 @@
-import unittest, tempfile, os, time
+import unittest, tempfile, os, time, datetime
 from unittest import mock
 from pipe import InboundMessage
 from brain.controller import handle_message, handle_bot_output
-from brain.intent import IntentResult
-from brain.session import store
-from brain import scheduler, material, circuit, rules, reflow
+from brain.planner import PlanResult
+from brain.session import store, render_history
+from brain import scheduler, material, circuit, rules, reflow, used_topics
 import brain.controller as controller
 
 class FakeExpert:
@@ -23,43 +23,53 @@ class FakeExpert:
         self.last_explain_context = context
         return self.text
 
-def msg(content, role="老板", mid="m1", mention_names=None):
+def msg(content, role="老板", mid="m1", mention_names=None, sender_open_id="ou_x"):
     return InboundMessage(message_id=mid, chat_id="oc_t", content=content,
-                          sender_open_id="ou_x", sender_role=role, mentions=[],
+                          sender_open_id=sender_open_id, sender_role=role, mentions=[],
                           mention_names=mention_names or [])
 
-def _fake_intent(content, history_text=""):
+def _fake_planner(msg, content, history_text="", rounds=None):
+    # 与旧 _fake_intent 同构的关键词→动作映射；未命中 → 闲聊（走 _chat_generate 模板）
+    rounds = rounds or []
     if "已发布" in content:
-        return IntentResult("确认已发布", {}, content)
+        return PlanResult("", "确认已发布", content)
+    if "确认" in content and "排期" in content:
+        return PlanResult("", "确认排期", content)
     if "学一下" in content or "记住" in content or "学个规则" in content:
-        return IntentResult("学规则", {}, content)
+        return PlanResult("", "学规则", content)
     if "确认" in content:
-        return IntentResult("确认规则", {}, content)
+        return PlanResult("", "确认规则", content)
     if "回流" in content or "复盘" in content or "播放" in content:
-        return IntentResult("数据回流", {}, content)
+        return PlanResult("", "数据回流", content)
     if "更新情报" in content or "搜竞对" in content:
-        return IntentResult("更新市场情报", {}, content)
+        return PlanResult("", "更新市场情报", content)
     if "不行" in content or "改掉" in content:
-        return IntentResult("反馈修改", {}, content)
+        return PlanResult("", "反馈修改", content)
     if "为什么" in content or "依据" in content or "哪来的" in content:
-        return IntentResult("追问", {}, content)
+        return PlanResult("", "追问", content)
     if "记素材" in content or "收下" in content:
-        return IntentResult("记素材", {}, content)
+        return PlanResult("", "记素材", content)
     if "完整讨论" in content or "看讨论" in content:
-        return IntentResult("看完整讨论", {}, content)
+        return PlanResult("", "看完整讨论", content)
     if "圆桌" in content or "讨论下" in content or "大家" in content:
-        return IntentResult("圆桌讨论", {}, content)
+        return PlanResult("", "圆桌讨论", content)
     if "审核" in content:
-        return IntentResult("审核脚本", {}, content)
+        return PlanResult("", "审核脚本", content)
+    if "已用选题" in content or "用过的选题" in content or "历史选题" in content or "用过哪些" in content:
+        return PlanResult("", "查已用选题", content)
     if "选题" in content or "角度" in content:
-        return IntentResult("出选题", {"count": "3"}, content)
+        return PlanResult("", "出选题", "", {"count": "3"})
     if "脚本" in content:
-        return IntentResult("写脚本", {}, content)
+        return PlanResult("", "写脚本", content)
     if "排期表" in content:
-        return IntentResult("看排期表", {}, content)
+        return PlanResult("", "看排期表", content)
     if "曝光" in content:
-        return IntentResult("改排期", {"count": "3", "content_type": "曝光", "date": "下周"}, content)
-    return IntentResult("其他", {}, content)
+        return PlanResult("", "改排期", content, {"count": "3", "content_type": "曝光", "date": "下周"})
+    try:
+        reply = controller._chat_generate(content, render_history(rounds))
+    except Exception:
+        reply = "需要我做什么？出选题/写脚本/看排期/讨论？"
+    return PlanResult(reply=reply, action="")
 
 class TestController(unittest.TestCase):
     def setUp(self):
@@ -71,15 +81,29 @@ class TestController(unittest.TestCase):
         tmp.close()
         self.path = tmp.name
         scheduler._SCHEDULE_PATH = self.path
+        self._reminded_orig = scheduler._REMINDED_PATH
+        rtmp = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8")
+        rtmp.close()
+        scheduler._REMINDED_PATH = rtmp.name
+        self.reminded_path = rtmp.name
+        scheduler._REMINDED.clear()
+        scheduler._LAST_REMINDED.clear()
+        self.used_tmp = tempfile.TemporaryDirectory()
+        self._used_orig = used_topics._USED_PATH
+        used_topics._USED_PATH = os.path.join(self.used_tmp.name, "已用选题.md")
         self.material_tmp = tempfile.TemporaryDirectory()
         material._MATERIAL_DIR = self.material_tmp.name
         self.ledger_tmp = tempfile.NamedTemporaryFile("w", suffix=".md", delete=False, encoding="utf-8")
         self.ledger_tmp.close()
         self._ledger_orig = circuit._LEDGER_PATH
         circuit._LEDGER_PATH = self.ledger_tmp.name
-        controller._recognize = _fake_intent
+        controller._planner = _fake_planner
         controller._last_passed.clear()
         controller._pending_action.clear()
+        controller._last_style.clear()
+        controller._pipelines.clear()
+        controller._requester_by_chat.clear()
+        controller._used_cursor.clear()
         controller._pull_history = lambda chat_id, n: "【同事】群里讨论了预算对比方案"
         controller._chat_generate = lambda content, history_text="": "需要我做什么？出选题/写脚本/看排期/讨论？"
         controller._context_put = lambda chat_id, role, task, context: "testtoken"
@@ -105,6 +129,11 @@ class TestController(unittest.TestCase):
 
     def tearDown(self):
         os.unlink(self.path)
+        scheduler._REMINDED_PATH = self._reminded_orig
+        if os.path.exists(self.reminded_path):
+            os.unlink(self.reminded_path)
+        used_topics._USED_PATH = self._used_orig
+        self.used_tmp.cleanup()
         self.material_tmp.cleanup()
         os.unlink(self.ledger_tmp.name)
         circuit._LEDGER_PATH = self._ledger_orig
@@ -122,6 +151,38 @@ class TestController(unittest.TestCase):
         out = handle_message(msg("帮我出3个选题"))
         self.assertTrue(any("席小题" in m.agent_tag for m in out))
 
+    def test_out_topic_async_sets_wait_topic(self):
+        emitted = []
+        controller._emit = lambda chat_id, text, tag: emitted.append((chat_id, text, tag))
+        def fake_by_role(role):
+            return {"profile": role, "open_id": f"ou_{role}"}
+        with mock.patch.object(controller.bots, "by_role", fake_by_role):
+            out = handle_message(msg("帮我出3个选题"))
+        self.assertEqual(controller._pipelines["oc_t"]["step"], "wait_topic")
+        self.assertTrue(any("席小题" in t for _, _, t in emitted))
+        # 异步派单不立即发提醒，等席小题产出回来再补
+        self.assertFalse(any("已用选题" in m.text for m in out))
+
+    def test_out_topic_wait_topic_hint_on_xiaoti_output(self):
+        emitted = []
+        controller._emit = lambda chat_id, text, tag: emitted.append((chat_id, text, tag))
+        def fake_by_role(role):
+            return {"profile": role, "open_id": f"ou_{role}"}
+        with mock.patch.object(controller.bots, "by_role", fake_by_role):
+            handle_message(msg("帮我出3个选题"))
+            self.assertEqual(controller._pipelines["oc_t"]["step"], "wait_topic")
+            # 探询句不算产出，不 pop 等待态
+            probe = InboundMessage(message_id="p1", chat_id="oc_t", content="需要我给你看选题的依据么？",
+                                   sender_open_id="ou_席小题", sender_role="席小题", mentions=[])
+            handle_bot_output(probe)
+            self.assertEqual(controller._pipelines["oc_t"]["step"], "wait_topic")
+            # 真正的选题正文回来 → pop + 补提醒
+            out = handle_bot_output(InboundMessage(
+                message_id="t1", chat_id="oc_t", content="【席小题】\n1.【曝光】普娃逆袭新加坡",
+                sender_open_id="ou_席小题", sender_role="席小题", mentions=[]))
+        self.assertNotIn("oc_t", controller._pipelines)
+        self.assertTrue(any("已用选题" in r.text for r in out))
+
     def test_write_script_chain(self):
         out = handle_message(msg("写条脚本，关于预算"))
         tags = [m.agent_tag for m in out]
@@ -132,9 +193,31 @@ class TestController(unittest.TestCase):
         out = handle_message(msg("看下排期表"))
         self.assertTrue(any("排期" in m.text for m in out))
 
+    def test_schedule_reply_prefers_base_link(self):
+        with mock.patch.object(controller, "_base_url", ""):
+            self.assertIn("当前排期表", controller._schedule_reply())
+            self.assertIn("日期", controller._schedule_reply())
+        with mock.patch.object(controller, "_base_url", "https://t.feishu.cn/base/abc"):
+            self.assertEqual(controller._schedule_reply(), "多维表格：https://t.feishu.cn/base/abc")
+
     def test_publisher_can_confirm(self):
         out = handle_message(msg("8/3普娃逆袭已发布", role="发片同事"))
         self.assertTrue(any("已发" in m.text or "确认" in m.text for m in out))
+
+    def test_confirm_schedule_stops_reminder(self):
+        # 有最近一条发布提醒 → 老板回「已确认排期」→ 该条不再提醒
+        scheduler.add_entry({"date": "8/5", "content_type": "曝光", "topic": "预算对比",
+                             "goal": "拉新", "status": "待产", "owner": "发片同事", "data": "—",
+                             "script": "", "source_chat": "oc_t", "publish_time": "12:00"})
+        now = datetime.datetime(2026, 8, 5, 11, 30)
+        self.assertEqual(len(scheduler.check_upcoming_publish(now)), 1)
+        out = handle_message(msg("已确认排期"))
+        self.assertTrue(any("不再提醒" in m.text for m in out))
+        self.assertEqual(scheduler.check_upcoming_publish(now), [])
+
+    def test_confirm_schedule_no_pending(self):
+        out = handle_message(msg("已确认排期"))
+        self.assertTrue(any("没有需要确认" in m.text for m in out))
 
     def test_publisher_cannot_override(self):
         out = handle_message(msg("下周三要3条曝光", role="发片同事"))
@@ -197,6 +280,18 @@ class TestController(unittest.TestCase):
     def test_ask_without_history(self):
         out = handle_message(msg("为什么选这个角度"))
         self.assertTrue(any("没有找到可追问的上一条产出" in m.text for m in out))
+
+    def test_fallback_planner_keyword_downgrade(self):
+        # planner LLM 崩溃 → 关键词兜底命中高信号指令（不静默）
+        with mock.patch.object(controller, "_planner_call", side_effect=RuntimeError("llm down")):
+            plan = controller._fallback_planner(msg("帮我出3个选题"), "帮我出3个选题", "", [])
+        self.assertEqual(plan.action, "出选题")
+
+    def test_fallback_planner_chat_returns_none(self):
+        # planner 崩溃 + 关键词也兜不住 → None（走老对话模板）
+        with mock.patch.object(controller, "_planner_call", side_effect=RuntimeError("llm down")):
+            plan = controller._fallback_planner(msg("今天天气不错"), "今天天气不错", "", [])
+        self.assertIsNone(plan)
 
     def test_last_expert_output_skips_probe(self):
         store.clear()
@@ -300,16 +395,25 @@ class TestController(unittest.TestCase):
         self.assertEqual(replies[0].agent_tag, "席小题")
         store.clear()
 
+    def test_script_detection_old_and_new_format(self):
+        # 席小文出稿不再带【席小文】前缀，旧格式仍兼容识别，标题提取不变
+        self.assertTrue(controller._is_script_output("## 脚本 v1：预算对比的坑\n\n正文"))
+        self.assertTrue(controller._is_script_output("【席小文】## 脚本 v1：预算对比的坑"))
+        self.assertFalse(controller._is_script_output("老板你好，这条脚本要不要审？"))
+        self.assertEqual(controller._script_title("## 脚本 v1：预算对比的坑\n\n正文"), "预算对比的坑")
+        self.assertEqual(controller._script_title("【席小文】## 脚本 v1：预算对比的坑"), "预算对比的坑")
+        self.assertEqual(controller._script_title("闲聊内容"), "")
+
     def test_handle_message_lookup_record_when_intent_other(self):
         # 意图归「其他」的查选题记录请求 → 真核对回执，不再闲聊承诺
         with mock.patch.object(controller.context_store, "load_basis",
                                return_value=("1.【曝光】预算对比\n2.【信任】费用拆分", "依据")):
-            old = controller._recognize
-            controller._recognize = lambda content, history_text="": IntentResult("其他", {}, content)
+            old = controller._planner
+            controller._planner = lambda msg, content, history_text, rounds: PlanResult(reply="", action="")
             try:
                 replies = handle_message(msg("刚才的选题你还能看到么"))
             finally:
-                controller._recognize = old
+                controller._planner = old
         texts = [r.text for r in replies]
         self.assertTrue(any("预算对比" in t for t in texts))
         self.assertFalse(any(t == "需要我做什么？出选题/写脚本/看排期/讨论？" for t in texts))
@@ -366,14 +470,64 @@ class TestController(unittest.TestCase):
         self.assertTrue(any(m.agent_tag == "席小核" for m in out))
         self.assertIsNotNone(self.xiaone.last_explain_context)
 
+    def test_long_feedback_msg_does_not_dump_stale_review(self):
+        # 2026-08-07 事故回归：老板发长消息纠正席小核看法（含「要」字），不得触发「要理由」直发旧存档
+        store.add_round("oc_t", [
+            {"speaker": "老板", "text": "写条脚本"},
+            {"speaker": "席小文", "text": "脚本 v1"},
+            {"speaker": "席小核", "text": "【审核结论】通过\n需要给您展示理由吗？"},
+        ])
+        old = controller._planner
+        controller._planner = lambda msg, content, history_text, rounds: PlanResult(reply="", action="")
+        try:
+            out = handle_message(msg("需要@席小习 上线，第一次审核中\"这个是可以说的，要修改席小核的看法"))
+        finally:
+            controller._planner = old
+        self.assertFalse(any(m.agent_tag == "席小核" for m in out))
+        self.assertFalse(any("审核理由" in m.text for m in out))
+
+    def test_review_reasons_requires_offer_anchor(self):
+        # 席小核没邀约「需要给您展示理由吗？」时，短「要」不触发直发存档（锚点门禁）
+        store.add_round("oc_t", [
+            {"speaker": "老板", "text": "写条脚本"},
+            {"speaker": "席小文", "text": "脚本 v1"},
+            {"speaker": "席小核", "text": "【审核结论】通过"},
+        ])
+        old = controller._planner
+        controller._planner = lambda msg, content, history_text, rounds: PlanResult(reply="", action="")
+        try:
+            out = handle_message(msg("要"))
+        finally:
+            controller._planner = old
+        self.assertFalse(any(m.agent_tag == "席小核" for m in out))
+
+    def test_revise_review_rules_learns_confirmed_rule(self):
+        # 2026-08-07 事故回归：老板纠正席小核看法 → 走「改审核看法」落已确认规则，不直发旧审核存档
+        store.add_round("oc_t", [
+            {"speaker": "老板", "text": "写条脚本"},
+            {"speaker": "席小文", "text": "脚本 v1"},
+            {"speaker": "席小核", "text": "【审核结论】不通过\n需要给您展示理由吗？"},
+        ])
+        old = controller._planner
+        controller._planner = lambda msg, content, history, rounds: PlanResult("", "改审核看法", "修正席小核看法")
+        try:
+            out = handle_message(msg("需要@席小习 上线，第一次审核中\"这个是可以说的，要修改席小核的看法"))
+        finally:
+            controller._planner = old
+        self.assertFalse(any("审核理由" in m.text for m in out))
+        self.assertTrue(any("已让席小核记住" in m.text for m in out))
+        self.assertTrue(any("费用承诺用软性表达" in r["rule"] for r in rules.load_rules()))
+        self.assertIn("请把老板这段话里席小核要遵守的审核标准提炼成规则", self.xiaoxi.last_task)
+
     def test_ask_appends_basis_archive(self):
+        # 追问席小题依据 → 直发存档的真实依据（不重生成）；basis 不存在才走 explain 派单
         with mock.patch.object(controller.context_store, "load_basis",
                                return_value=("1.选题A\n2.选题B", "1.依据A\n2.依据B")):
             handle_message(msg("帮我出3个选题"))
             self.xiaoti.last_explain_context = None
-            handle_message(msg("为什么选这个角度"))
-            self.assertIn("你上次的选题与依据", self.xiaoti.last_explain_context)
-            self.assertIn("1.依据A", self.xiaoti.last_explain_context)
+            out = handle_message(msg("为什么选这个角度"))
+            self.assertIsNone(self.xiaoti.last_explain_context)
+            self.assertTrue(any(m.agent_tag == "席小题" and "1.依据A" in m.text for m in out))
 
     def test_record_material_saves(self):
         out = handle_message(msg("记素材：普娃预算对比，三年比国内省12万"))
@@ -385,18 +539,18 @@ class TestController(unittest.TestCase):
         self.assertTrue(any("无权限" in m.text for m in out))
 
     def test_topic_asks_params_when_vague(self):
-        controller._recognize = lambda content, history: IntentResult("出选题", {}, content)
+        controller._planner = lambda msg, content, history, rounds: PlanResult("", "出选题", "")
         out = handle_message(msg("帮我出个选题"))
         self.assertTrue(any("出几个" in m.text for m in out))
         self.assertFalse(any(m.agent_tag == "席小题" for m in out))
 
     def test_topic_uses_normalized_task(self):
-        controller._recognize = lambda content, history: IntentResult("出选题", {}, content, "出3个关于预算对比的选题，反常识角度")
+        controller._planner = lambda msg, content, history, rounds: PlanResult("", "出选题", "出3个关于预算对比的选题，反常识角度")
         handle_message(msg("出3个选题，关于预算对比"))
         self.assertEqual(self.xiaoti.last_task, "出3个关于预算对比的选题，反常识角度")
 
     def test_write_script_uses_normalized_task(self):
-        controller._recognize = lambda content, history: IntentResult("写脚本", {}, content, "写一条60秒脚本，主题：新加坡预算对比")
+        controller._planner = lambda msg, content, history, rounds: PlanResult("", "写脚本", "写一条60秒脚本，主题：新加坡预算对比")
         handle_message(msg("写条脚本"))
         self.assertEqual(self.xiaowen.last_task, "写一条60秒脚本，主题：新加坡预算对比")
 
@@ -448,7 +602,7 @@ class TestController(unittest.TestCase):
         self.assertIn("议题：【测试】3个选题", text)
 
     def test_roundtable_requires_subject(self):
-        controller._recognize = lambda content, history: IntentResult("圆桌讨论", {}, content)
+        controller._planner = lambda msg, content, history, rounds: PlanResult("", "圆桌讨论", "")
         out = handle_message(msg("开圆桌会议"))
         self.assertTrue(any("需要一个议题" in m.text for m in out))
 
@@ -800,7 +954,7 @@ class TestController(unittest.TestCase):
         self.assertIn("审核视角", summary)
 
     def test_doubt_pauses_and_mentions_boss(self):
-        # 席小核给疑问点（需老板确认）→ 暂停流水线 wait_boss + @老板拍板，不再只弹一句就丢
+        # 席小核给疑问点（需老板确认）→ 暂停流水线 wait_boss + @提出者（写脚本需求发起人）拍板，不再只弹一句就丢
         emitted = []
         controller._emit = lambda chat_id, text, tag: emitted.append((chat_id, text, tag))
         def fake_by_role(role):
@@ -808,7 +962,29 @@ class TestController(unittest.TestCase):
         with mock.patch.object(controller.bots, "by_role", fake_by_role), \
              mock.patch.object(controller.identity, "load_roles",
                                return_value={"boss_open_ids": [], "product_open_ids": ["ou_product"]}):
-            handle_message(msg("写条脚本，关于预算"))
+            handle_message(msg("写条脚本，关于预算", sender_open_id="ou_boss"))
+            wen = InboundMessage(message_id="w1", chat_id="oc_t", content="【测试】脚本 v1",
+                                 sender_open_id="ou_席小文", sender_role="席小文", mentions=[])
+            handle_bot_output(wen)
+            he_doubt = InboundMessage(message_id="h1", chat_id="oc_t",
+                                      content="【审核结论】需老板确认\n费用数字和知识库对不上，需要老板确认按哪个算。",
+                                      sender_open_id="ou_席小核", sender_role="席小核", mentions=[])
+            replies = handle_bot_output(he_doubt)
+        self.assertEqual(controller._pipelines["oc_t"]["step"], "wait_boss")
+        # 优先 @ 提出者 ou_boss，不 @ 产品
+        self.assertTrue(any('<at user_id="ou_boss"></at>' in r.text for r in replies))
+        self.assertFalse(any('<at user_id="ou_product"></at>' in r.text for r in replies))
+
+    def test_doubt_mentions_admin_when_no_requester(self):
+        # 没记录到提出者（如进程重启后）→ 回落 @ 全体老板/产品
+        emitted = []
+        controller._emit = lambda chat_id, text, tag: emitted.append((chat_id, text, tag))
+        def fake_by_role(role):
+            return {"profile": role, "open_id": f"ou_{role}"}
+        with mock.patch.object(controller.bots, "by_role", fake_by_role), \
+             mock.patch.object(controller.identity, "load_roles",
+                               return_value={"boss_open_ids": [], "product_open_ids": ["ou_product"]}):
+            handle_message(msg("写条脚本，关于预算", sender_open_id=""))
             wen = InboundMessage(message_id="w1", chat_id="oc_t", content="【测试】脚本 v1",
                                  sender_open_id="ou_席小文", sender_role="席小文", mentions=[])
             handle_bot_output(wen)
@@ -818,6 +994,58 @@ class TestController(unittest.TestCase):
             replies = handle_bot_output(he_doubt)
         self.assertEqual(controller._pipelines["oc_t"]["step"], "wait_boss")
         self.assertTrue(any('<at user_id="ou_product"></at>' in r.text for r in replies))
+
+    def test_write_script_records_requester(self):
+        # 发起写脚本的真人 → 记录 open_id，供定稿/审核疑问针对性 @
+        controller._write_script(msg("写条脚本"), "写条脚本", "写「预算对比」这条", [], [], {"count": "2"})
+        self.assertEqual(controller._requester_by_chat.get("oc_t"), "ou_x")
+
+    def test_ask_schedule_mentions_requester(self):
+        controller._requester_by_chat["oc_t"] = "ou_requester"
+        out = []
+        controller._ask_schedule("oc_t", "【席小文】## 脚本 v1", out)
+        self.assertTrue(any('<at user_id="ou_requester"></at>' in r.text for r in out))
+        self.assertTrue(any("上排期" in r.text for r in out))
+
+    def test_ask_schedule_no_requester_plain(self):
+        out = []
+        controller._ask_schedule("oc_t", "脚本", out)
+        self.assertFalse(any('<at user_id=' in r.text for r in out))
+
+    def test_schedule_reask_mentions_requester(self):
+        # wait_schedule 里日期解析不出再追问 → @ 提出者
+        controller._requester_by_chat["oc_t"] = "ou_requester"
+        controller._pipelines["oc_t"] = {"step": "wait_schedule", "script": "脚本", "ts": 0}
+        out = handle_message(msg("就排吧", role="老板"))
+        self.assertTrue(any('<at user_id="ou_requester"></at>' in r.text for r in out))
+        self.assertTrue(any("具体日期时间" in r.text for r in out))
+        self.assertEqual(controller._pipelines["oc_t"]["step"], "wait_schedule")
+
+    def test_requester_can_reply_schedule(self):
+        # 提出者本人（非 admin，如发片同事）也能回排期：gate 从 admin-only 放开给流水线发起人
+        controller._requester_by_chat["oc_t"] = "ou_x"
+        controller._draft_ctx["oc_t"] = ("预算对比", "曝光")
+        controller._pipelines["oc_t"] = {"step": "wait_schedule", "script": "脚本", "ts": 0}
+        out = handle_message(msg("排 8/10 12:00", role="发片同事"))
+        self.assertTrue(any("已排上" in r.text for r in out))
+        self.assertNotIn("oc_t", controller._pipelines)
+
+    def test_requester_can_reply_wait_boss(self):
+        # 提出者本人（非 admin）也能拍板审核疑问：回「可以了」→ 放行 → wait_schedule
+        controller._requester_by_chat["oc_t"] = "ou_x"
+        controller._pipelines["oc_t"] = {"step": "wait_boss", "script": "脚本",
+                                         "reviewer": "需老板确认", "fix_rounds": 0, "ts": 0}
+        out = handle_message(msg("可以了", role="发片同事"))
+        self.assertTrue(any("上排期" in r.text for r in out))
+        self.assertEqual(controller._pipelines["oc_t"]["step"], "wait_schedule")
+
+    def test_nonowner_user_cannot_schedule(self):
+        # 非提出者的用户回排期 → 不路由：pipeline 保持 wait_schedule，不产生「已排上」
+        controller._requester_by_chat["oc_t"] = "ou_owner"
+        controller._pipelines["oc_t"] = {"step": "wait_schedule", "script": "脚本", "ts": 0}
+        out = handle_message(msg("排 8/10 12:00", role="用户", sender_open_id="ou_other"))
+        self.assertEqual(controller._pipelines["oc_t"]["step"], "wait_schedule")
+        self.assertFalse(any("已排上" in r.text for r in out))
 
     def test_boss_answer_learns_and_modifies(self):
         # 老板答复疑问 → 落已确认规则（席小核/席小文都学）+ 席小文按答案修改 + wait_fix 复审
@@ -833,6 +1061,7 @@ class TestController(unittest.TestCase):
         self.assertTrue(any("收到老板答案" in r.text for r in out))
         self.assertEqual(controller._pipelines["oc_t"]["step"], "wait_fix")
         self.assertTrue(any(r["status"] == "已确认" and "费用按8万算没问题" in r["rule"]
+                            and r["type"] == "事实规则"
                             for r in rules.load_rules()))
         wen_tags = [text for _, text, tag in emitted if tag == "席小文"]
         self.assertTrue(wen_tags)
@@ -863,8 +1092,8 @@ class TestController(unittest.TestCase):
             return {"profile": role, "open_id": f"ou_{role}"}
         with mock.patch.object(controller.bots, "by_role", fake_by_role):
             out = handle_message(msg("确定了可以下一步了，就这么样", role="老板"))
-        self.assertTrue(any("按通过定稿" in r.text for r in out))
-        self.assertNotIn("oc_t", controller._pipelines)
+        self.assertTrue(any("上排期" in r.text for r in out))
+        self.assertEqual(controller._pipelines["oc_t"]["step"], "wait_schedule")
         self.assertNotIn("席小文", [t for _, _, t in emitted])
         self.assertNotIn("确定了可以下一步了", [r["rule"] for r in rules.load_rules()])
 
@@ -874,8 +1103,8 @@ class TestController(unittest.TestCase):
             controller._pipelines["oc_t"] = {"step": "wait_boss", "script": "脚本",
                                              "reviewer": "需老板确认", "fix_rounds": 0, "ts": 0}
             out = handle_message(msg(phrase, role="老板"))
-            self.assertTrue(any("按通过定稿" in r.text for r in out), phrase)
-            self.assertNotIn("oc_t", controller._pipelines, phrase)
+            self.assertTrue(any("上排期" in r.text for r in out), phrase)
+            self.assertEqual(controller._pipelines["oc_t"]["step"], "wait_schedule", phrase)
             self.assertNotIn(phrase, [r["rule"] for r in rules.load_rules()], phrase)
 
     def test_boss_substantive_answer_still_learns(self):
@@ -903,12 +1132,12 @@ class TestController(unittest.TestCase):
         controller._register_proposal("oc_t", "要不要重新出一版？【提议】重新出选题：按预算方向出3个")
         pending = controller._pending_action.get("oc_t")
         self.assertIsNotNone(pending)
-        self.assertEqual(pending["intent"], "出选题")
+        self.assertEqual(pending["action"], "出选题")
         self.assertEqual(pending["task"], "按预算方向出3个")
 
     def test_register_proposal_script_intent(self):
         controller._register_proposal("oc_t", "要不要写一条？【提议】写脚本：按预算方向写一条")
-        self.assertEqual(controller._pending_action.get("oc_t", {}).get("intent"), "写脚本")
+        self.assertEqual(controller._pending_action.get("oc_t", {}).get("action"), "写脚本")
 
     def test_register_proposal_rejects_schedule(self):
         # 改排期需具体日期/选题，聊天提议锁定不了，不登记——防肯定回复后按占位生成垃圾（8/5 12:35 bug 同类）
@@ -921,19 +1150,19 @@ class TestController(unittest.TestCase):
         controller._chat_reply(msg("随便聊聊"), "随便聊聊", [], replies)
         pending = controller._pending_action.get("oc_t")
         self.assertIsNotNone(pending)
-        self.assertEqual(pending["intent"], "出选题")
+        self.assertEqual(pending["action"], "出选题")
         self.assertEqual(pending["task"], "按预算方向出3个")
         self.assertNotIn("【提议】", replies[0].text)
         self.assertIn("重新出一版", replies[0].text)
 
     def test_handle_message_affirmative_runs_pending_topic(self):
-        controller._pending_action["oc_t"] = {"intent": "出选题", "params": {}, "task": "按预算方向出3个", "ts": time.time()}
+        controller._pending_action["oc_t"] = {"action": "出选题", "task": "按预算方向出3个", "ts": time.time()}
         out = handle_message(msg("好"))
         self.assertTrue(any("席小题" in m.agent_tag for m in out))
         self.assertNotIn("oc_t", controller._pending_action)
 
     def test_handle_message_affirmative_runs_pending_script(self):
-        controller._pending_action["oc_t"] = {"intent": "写脚本", "params": {}, "task": "按预算方向写一条", "ts": time.time()}
+        controller._pending_action["oc_t"] = {"action": "写脚本", "task": "按预算方向写一条", "ts": time.time()}
         out = handle_message(msg("可以"))
         tags = [m.agent_tag for m in out]
         self.assertIn("席小文", tags)
@@ -947,7 +1176,7 @@ class TestController(unittest.TestCase):
         self.assertTrue(any(m.agent_tag == "小席" for m in out))
 
     def test_handle_message_affirmative_view_schedule(self):
-        controller._pending_action["oc_t"] = {"intent": "看排期表", "params": {}, "task": "", "ts": time.time()}
+        controller._pending_action["oc_t"] = {"action": "看排期表", "task": "", "ts": time.time()}
         out = handle_message(msg("行"))
         self.assertIn("排期表", out[0].text)
         self.assertNotIn("oc_t", controller._pending_action)
@@ -957,7 +1186,7 @@ class TestController(unittest.TestCase):
         controller._register_actions("oc_t", '要不要重出一版？\n【行动】{"action":"重新出选题","task":"按预算方向出3个","when":"待确认"}', [], [])
         pending = controller._pending_action.get("oc_t")
         self.assertIsNotNone(pending)
-        self.assertEqual(pending["intent"], "出选题")
+        self.assertEqual(pending["action"], "出选题")
         self.assertEqual(pending["task"], "按预算方向出3个")
 
     def test_register_action_pending_default_task(self):
@@ -986,7 +1215,7 @@ class TestController(unittest.TestCase):
         controller._chat_generate = lambda content, history_text="": "懂了，要不要重新出一版？\n【行动】{\"action\":\"重新出选题\",\"task\":\"按预算方向出3个\",\"when\":\"待确认\"}"
         replies = []
         controller._chat_reply(msg("随便聊聊"), "随便聊聊", [], replies)
-        self.assertEqual(controller._pending_action.get("oc_t", {}).get("intent"), "出选题")
+        self.assertEqual(controller._pending_action.get("oc_t", {}).get("action"), "出选题")
         self.assertNotIn("【行动】", replies[0].text)
         self.assertIn("重新出一版", replies[0].text)
 
@@ -994,12 +1223,12 @@ class TestController(unittest.TestCase):
         # 专家回复带【动作名】建议下一步 → 登记待确认动作，task 取标记后的内容
         controller._register_expert_proposal("oc_t", "要不要我【重新出选题】按预算对比方向出3个？")
         pending = controller._pending_action.get("oc_t")
-        self.assertEqual(pending["intent"], "出选题")
+        self.assertEqual(pending["action"], "出选题")
         self.assertEqual(pending["task"], "按预算对比方向出3个")
 
     def test_register_expert_proposal_write_script(self):
         controller._register_expert_proposal("oc_t", "要不要我【写脚本】把这个角度落成一条60秒？")
-        self.assertEqual(controller._pending_action.get("oc_t", {}).get("intent"), "写脚本")
+        self.assertEqual(controller._pending_action.get("oc_t", {}).get("action"), "写脚本")
 
     def test_lookup_topic_record_force(self):
         # force=True 跳过关键词对：意图已判定查记录 / 小席立即动作时直接用
@@ -1021,10 +1250,264 @@ class TestController(unittest.TestCase):
         # 意图「查记录」→ 真核对回执，不再是空口承诺
         with mock.patch.object(controller.context_store, "load_basis",
                                return_value=("1.【曝光】预算对比\n2.【信任】费用拆分", "依据")):
-            controller._recognize = lambda content, history_text="": IntentResult("查记录", {}, content)
+            controller._planner = lambda msg, content, history_text, rounds: PlanResult("", "查记录", content)
             out = handle_message(msg("刚才的选题你还能看见么"))
         self.assertTrue(any("预算对比" in m.text for m in out))
         self.assertTrue(any(m.agent_tag == "小席" for m in out))
+
+    def test_apply_script_count_appends_count(self):
+        task = controller._apply_script_count("写「女儿死磕莱佛士」这条的脚本", "选题2给我出两个脚本", {"count": "2"})
+        self.assertIn("女儿死磕莱佛士", task)
+        self.assertIn("2 条", task)
+
+    def test_apply_script_count_skips_single(self):
+        task = controller._apply_script_count("写「预算对比」这条的脚本", "写条脚本", {"count": "1"})
+        self.assertEqual(task, "写「预算对比」这条的脚本")
+
+    def test_apply_script_count_no_params(self):
+        task = controller._apply_script_count("写「预算对比」这条的脚本", "写条脚本", {})
+        self.assertEqual(task, "写「预算对比」这条的脚本")
+
+    def test_write_script_passes_count_to_xiaowen(self):
+        # 老板说「出两个脚本」→ count=2 要写进派给席小文的任务，别让只出一条
+        controller._write_script(msg("写条脚本"), "写条脚本", "写「预算对比」这条", [], [], {"count": "2"})
+        self.assertIn("2 条", self.xiaowen.last_task)
+        self.assertIn("预算对比", self.xiaowen.last_task)
+
+    def test_write_script_count_from_intent_params(self):
+        # 端到端：planner 带 count 参数 → 派单席小文的任务含数量
+        controller._planner = lambda msg, content, history_text, rounds: PlanResult("", "写脚本", "选题2给我出两个脚本", {"count": "2"})
+        out = handle_message(msg("选题2给我出两个脚本"))
+        self.assertIn("2 条", self.xiaowen.last_task)
+
+    def test_schedule_empty_params_asks_details_not_fabricate(self):
+        # 空参数 + 内容无明确排期信息 → 绝不静默编占位行，问老板要细节
+        replies = []
+        with mock.patch.object(controller, "add_entry") as add:
+            controller._exec_change_schedule(msg("随便"), "随便", "", [], replies, {})
+        add.assert_not_called()
+        self.assertTrue(any("哪条选题" in r.text for r in replies))
+
+    def test_schedule_empty_params_but_explicit_content_adds(self):
+        # 空参数但内容有明确排期词（下周三要3条曝光）→ 排期节奏场景，照常编行
+        replies = []
+        with mock.patch.object(controller, "add_entry") as add:
+            controller._exec_change_schedule(msg("下周三要3条曝光"), "下周三要3条曝光", "", [], replies, {})
+        self.assertEqual(add.call_count, 3)
+
+    def test_add_column_script_content_boss(self):
+        with mock.patch.object(controller.base_bridge, "add_column") as ac, \
+             mock.patch.object(controller, "_planner",
+                               lambda msg, content, history="", rounds=None: PlanResult("", "改表格结构", "")):
+            out = handle_message(msg("把详细脚本内容也放到里面吧，单开一列"))
+        ac.assert_called_once_with("脚本内容")
+        self.assertTrue(any("已加" in r.text for r in out))
+
+    def test_user_cannot_add_column(self):
+        with mock.patch.object(controller, "_planner",
+                               lambda msg, content, history="", rounds=None: PlanResult("", "改表格结构", "")):
+            out = handle_message(msg("单开一列放脚本内容", role="用户"))
+        self.assertTrue(any("无权限" in r.text for r in out))
+
+    def test_parse_column_name(self):
+        self.assertEqual(controller._parse_column_name("把详细脚本内容也放到里面吧，单开一列"), "脚本内容")
+        self.assertEqual(controller._parse_column_name("加个字段放负责人"), "负责人")
+        self.assertEqual(controller._parse_column_name("就聊个天"), "")
+
+    def test_audit_pass_sets_wait_schedule(self):
+        controller._pipelines["oc_t"] = {"step": "wait_he", "script": "【席小文】## 脚本 预算对比",
+                                         "fix_rounds": 0, "ts": time.time()}
+        he = InboundMessage(message_id="h1", chat_id="oc_t", content="✅ 通过：无红线，可进入发布流程。",
+                            sender_open_id="ou_席小核", sender_role="席小核", mentions=[])
+        out = handle_bot_output(he)
+        self.assertEqual(controller._pipelines["oc_t"]["step"], "wait_schedule")
+        self.assertTrue(any("上排期" in r.text for r in out))
+
+    def test_schedule_resolve_adds_entry_with_script(self):
+        controller._draft_ctx["oc_t"] = ("预算对比", "曝光")
+        controller._pipelines["oc_t"] = {"step": "wait_schedule", "script": "【席小文】## 脚本 预算对比",
+                                         "ts": time.time()}
+        rows_before = len(scheduler.load_schedule())
+        out = handle_message(msg("排 8/10 12:00"))
+        rows = scheduler.load_schedule()
+        self.assertEqual(len(rows), rows_before + 1)
+        last = rows[-1]
+        self.assertEqual(last["date"], "8/10")
+        self.assertEqual(last["publish_time"], "12:00")
+        self.assertEqual(last["topic"], "预算对比")
+        self.assertEqual(last["content_type"], "曝光")
+        self.assertEqual(last["status"], "待产")
+        self.assertEqual(last["owner"], "发片同事")
+        self.assertEqual(last["script"], "【席小文】## 脚本 预算对比")
+        self.assertEqual(last["source_chat"], "oc_t")
+        self.assertNotIn("oc_t", controller._pipelines)
+
+    def test_schedule_resolve_chinese_date_with_owner(self):
+        # 中文日期「8月6日」+ 负责人一句话直接排成，不追问、负责人不丢
+        controller._draft_ctx["oc_t"] = ("新加坡留学机构排行榜，谁在花钱买榜？家长照着榜单选中介，最容易踩坑", "信任")
+        controller._pipelines["oc_t"] = {"step": "wait_schedule", "script": "【席小文】## 脚本 排行榜",
+                                         "ts": time.time()}
+        rows_before = len(scheduler.load_schedule())
+        out = handle_message(msg("上排期表8月6日12:05，负责人张艺宝"))
+        rows = scheduler.load_schedule()
+        self.assertEqual(len(rows), rows_before + 1)
+        last = rows[-1]
+        self.assertEqual(last["date"], "8/6")
+        self.assertEqual(last["publish_time"], "12:05")
+        self.assertEqual(last["owner"], "张艺宝")
+        self.assertEqual(last["topic"], "新加坡留学机构排行榜，谁在花钱买榜？家长照着榜单选中介，最容易踩坑")
+        self.assertNotIn("oc_t", controller._pipelines)
+        self.assertFalse(any("具体日期" in r.text for r in out))
+
+    def test_schedule_resolve_adds_used_topic(self):
+        # 定稿排上排期表 → 选题自动登记进已用选题库
+        controller._draft_ctx["oc_t"] = ("预算对比", "曝光")
+        controller._pipelines["oc_t"] = {"step": "wait_schedule", "script": "【席小文】## 脚本 预算对比",
+                                         "ts": time.time()}
+        handle_message(msg("排 8/10 12:00"))
+        self.assertIn("预算对比", used_topics.load_used())
+
+    def test_schedule_placeholder_does_not_add_used(self):
+        # 改排期占位多条（曝光选题N）→ 不登记进已用选题库
+        replies = []
+        with mock.patch.object(controller, "add_used") as add_used:
+            controller._exec_change_schedule(msg("下周三要3条曝光"), "下周三要3条曝光", "", [], replies, {})
+        add_used.assert_not_called()
+
+    def test_schedule_declined_no_entry(self):
+        controller._pipelines["oc_t"] = {"step": "wait_schedule", "script": "脚本", "ts": time.time()}
+        rows_before = len(scheduler.load_schedule())
+        out = handle_message(msg("先不排"))
+        self.assertEqual(len(scheduler.load_schedule()), rows_before)
+        self.assertNotIn("oc_t", controller._pipelines)
+        self.assertTrue(any("先不排" in r.text for r in out))
+
+    def test_user_blocked_from_write_script(self):
+        out = handle_message(msg("写条脚本", role="用户"))
+        self.assertTrue(any("无权限" in r.text for r in out))
+        self.assertFalse(any(r.agent_tag in ("席小文", "席小核") for r in out))
+
+    def test_user_blocked_from_schedule(self):
+        out = handle_message(msg("下周三要3条曝光", role="用户"))
+        self.assertTrue(any("无权限" in r.text for r in out))
+
+    def test_user_allowed_readonly_view_schedule(self):
+        out = handle_message(msg("看下排期表", role="用户"))
+        self.assertTrue(any("排期" in r.text for r in out))
+        self.assertFalse(any("无权限" in r.text for r in out))
+
+    def test_view_used_topics_first_page(self):
+        for i in range(12):
+            used_topics.add_used(f"选题{i}")
+        out = handle_message(msg("看已用选题"))
+        self.assertTrue(any("第1页" in r.text for r in out))
+        self.assertTrue(any("继续发就说" in r.text for r in out))
+        self.assertEqual(controller._used_cursor["oc_t"], 10)
+
+    def test_view_used_topics_all_shown_in_one_page(self):
+        for i in range(5):
+            used_topics.add_used(f"选题{i}")
+        out = handle_message(msg("看已用选题"))
+        self.assertTrue(any("已全部展示已选用选题" in r.text for r in out))
+        self.assertNotIn("oc_t", controller._used_cursor)
+
+    def test_view_used_topics_continue_page(self):
+        for i in range(12):
+            used_topics.add_used(f"选题{i}")
+        handle_message(msg("看已用选题"))
+        out = handle_message(msg("继续"))
+        self.assertTrue(any("第2页" in r.text for r in out))
+        self.assertTrue(any("已全部展示已选用选题" in r.text for r in out))
+        self.assertNotIn("oc_t", controller._used_cursor)
+
+    def test_view_used_topics_stop(self):
+        for i in range(12):
+            used_topics.add_used(f"选题{i}")
+        handle_message(msg("看已用选题"))
+        out = handle_message(msg("够了"))
+        self.assertNotIn("oc_t", controller._used_cursor)
+        self.assertTrue(any("已用选题看完了" in r.text for r in out))
+
+    def test_view_used_topics_empty(self):
+        out = handle_message(msg("看已用选题"))
+        self.assertTrue(any("还是空的" in r.text for r in out))
+
+    def test_user_can_view_used_topics(self):
+        used_topics.add_used("选题A")
+        out = handle_message(msg("看已用选题", role="用户"))
+        self.assertTrue(any("已用选题" in r.text for r in out))
+        self.assertFalse(any("无权限" in r.text for r in out))
+
+    def test_unknown_cannot_view_used_topics(self):
+        out = handle_message(msg("看已用选题", role="未知"))
+        self.assertTrue(any("无权限" in r.text for r in out))
+
+    def test_user_allowed_readonly_feedback(self):
+        handle_message(msg("帮我出3个选题"))
+        out = handle_message(msg("这个脚本不行，把开头改掉", role="用户"))
+        self.assertFalse(any("无权限" in r.text for r in out))
+
+    def test_write_asks_style_when_multiple_users(self):
+        # 多个风格库且未指定 → 小席先问用谁的，绝不默认派单
+        with mock.patch.object(controller, "style_users", return_value=["老席", "张艺宝"]):
+            out = handle_message(msg("写条脚本"))
+        self.assertTrue(any("按谁的风格" in r.text for r in out))
+        self.assertEqual(controller._pipelines["oc_t"]["step"], "wait_style")
+        self.assertIsNone(self.xiaowen.last_task)
+
+    def test_write_single_user_no_ask(self):
+        # 只有老席一个风格 → 不反问，直接用老席
+        with mock.patch.object(controller, "style_users", return_value=["老席"]):
+            out = handle_message(msg("写条脚本"))
+        self.assertFalse(any("按谁的风格" in r.text for r in out))
+        self.assertIsNotNone(self.xiaowen.last_task)
+        self.assertNotIn("oc_t", controller._pipelines)
+
+    def test_write_resolves_style_choice(self):
+        # 老板回一个人名 → 记入 _last_style，并按该风格重新派单（任务带风格指令）
+        controller._pipelines["oc_t"] = {"step": "wait_style", "content": "写条脚本", "task": "",
+                                         "params": {}, "ts": time.time()}
+        seen = []
+        with mock.patch.object(controller, "style_users", return_value=["老席", "张艺宝"]), \
+             mock.patch.object(controller, "_dispatch_expert",
+                               side_effect=lambda cid, rep, role, task, context="":
+                                   seen.append((role, task)) or None):
+            out = handle_message(msg("张艺宝"))
+        self.assertEqual(controller._last_style.get("oc_t"), "张艺宝")
+        self.assertNotEqual(controller._pipelines.get("oc_t", {}).get("step"), "wait_style")
+        self.assertEqual(controller._pipelines.get("oc_t", {}).get("step"), "wait_wen")  # 已按风格重新派单
+        self.assertTrue(any("按「张艺宝」的风格" in r.text for r in out))
+        self.assertEqual(seen[0][0], "席小文")
+        self.assertEqual(seen[0][1], "写条脚本")  # 风格指令由 _dispatch_expert 注入（另测）
+
+    def test_write_uses_explicit_style_request(self):
+        # 写脚本指令直接点名风格 → 免反问，直接按该风格
+        replies = []
+        with mock.patch.object(controller, "style_users", return_value=["老席", "张艺宝"]):
+            controller._write_script(msg("按张艺宝的风格写条脚本"), "按张艺宝的风格写条脚本",
+                                     "", [], replies, {})
+        self.assertEqual(controller._last_style.get("oc_t"), "张艺宝")
+        self.assertNotIn("oc_t", controller._pipelines)
+
+    def test_dispatch_prepends_style_marker_for_non_default(self):
+        # 非老席风格 → 派单任务开头带【风格:XX】，专家bot据此换风格/分库学习
+        controller._last_style["oc_t"] = "张艺宝"
+        seen = []
+        with mock.patch.object(controller, "run_expert",
+                               side_effect=lambda role, task, context="", factories=None:
+                                   seen.append((role, task)) or "ok"):
+            controller._dispatch_expert("oc_t", [], "席小文", "写条脚本", "ctx")
+        self.assertTrue(seen[0][1].startswith("【风格:张艺宝】写条脚本"))
+
+    def test_dispatch_no_marker_for_default(self):
+        # 默认老席 → 不加风格指令，保持原任务
+        controller._last_style.pop("oc_t", None)
+        seen = []
+        with mock.patch.object(controller, "run_expert",
+                               side_effect=lambda role, task, context="", factories=None:
+                                   seen.append((role, task)) or "ok"):
+            controller._dispatch_expert("oc_t", [], "席小文", "写条脚本", "ctx")
+        self.assertEqual(seen[0][1], "写条脚本")
 
 if __name__ == "__main__":
     unittest.main()

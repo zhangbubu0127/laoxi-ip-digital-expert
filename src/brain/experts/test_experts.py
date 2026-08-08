@@ -38,6 +38,20 @@ class TestExperts(unittest.TestCase):
         system = fg.calls[0][0]
         self.assertIn("费用数字必须与知识库一致", system)
         self.assertIn("自称「老席」", system)
+
+    def test_xiaowen_threads_style_user(self):
+        # 非老席风格 → 加载该用户风格库 + 该用户规则，默认老席保持老席
+        fg = FakeGen()
+        with mock.patch("brain.experts.xiaowen.load_style", return_value="SENTINEL_STYLE") as ls:
+            XiaowenExpert(generate=fg, style_user="张艺宝").handle("普娃预算不够")
+        system = fg.calls[0][0]
+        self.assertIn("SENTINEL_STYLE", system)
+        self.assertIn("风格库：张艺宝", system)
+        self.assertIn("张艺宝 风格偏好", system)
+        ls.assert_called_once_with("张艺宝")
+        fg2 = FakeGen()
+        XiaowenExpert(generate=fg2).handle("普娃预算不够")
+        self.assertIn("风格库：老席", fg2.calls[0][0])
         self.assertIn("无书面过渡词", system)
 
     def test_xiaone_rejects_redline_word_locally(self):
@@ -108,7 +122,8 @@ class TestExperts(unittest.TestCase):
         fg = FakeGen()
         XiaowenExpert(generate=fg).handle("写条脚本，关于预算对比")
         user = fg.calls[0][1]
-        self.assertIn("【席小文】## 脚本 v1", user)
+        self.assertIn("## 脚本 v1", user)
+        self.assertNotIn("【席小文】## 脚本", user)
         self.assertIn("【口播正文】", user)
         self.assertIn("## 结构拆解", user)
         self.assertIn("| 时间段 | 内容 | 目的 |", user)
@@ -131,6 +146,9 @@ class TestExperts(unittest.TestCase):
         self.assertIn("rules", system)
         self.assertIn("change", system)
         self.assertIn("rule", system)
+        self.assertIn("type", system)
+        self.assertIn("表达偏好", system)
+        self.assertIn("禁止事项", system)
 
     def test_xiaone_verifies_external_claims(self):
         fg = FakeGenReturn('{"judgement":"通过","claims":[{"fact":"新加坡国立大学"}]}')
@@ -194,14 +212,13 @@ class TestExperts(unittest.TestCase):
         self.assertIn("竞对情报/市场热点", system)
         self.assertIn("新东方前途文书模板化", system)
 
-    def test_xiaoti_quota_half_market_half_local(self):
+    def test_xiaoti_quota_guides_balanced_sourcing(self):
         fg = FakeGen()
         XiaotiExpert(generate=fg).handle("帮我出10个选题")
         user = fg.calls[0][1]
         self.assertIn("取材配额", user)
-        self.assertIn("一半取材于【竞对情报/市场热点】", user)
-        self.assertIn("另一半取材于本地知识库", user)
-        self.assertIn("禁止全部来自单一来源", user)
+        self.assertIn("尽量兼顾", user)
+        self.assertIn("别清一色只用一个来源", user)
         self.assertIn("标注取材来源", user)
 
     def test_xiaoti_quota_no_count_still_instructs_split(self):
@@ -210,6 +227,27 @@ class TestExperts(unittest.TestCase):
         user = fg.calls[0][1]
         self.assertIn("取材配额", user)
         self.assertNotIn("本批约", user)
+
+    def test_xiaoti_prompt_includes_used_topics(self):
+        with mock.patch("brain.experts.xiaoti.load_used", return_value=["普娃逆袭", "费用对比"]):
+            fg = FakeGen()
+            XiaotiExpert(generate=fg).handle("帮我出3个选题")
+        user = fg.calls[0][1]
+        self.assertIn("已用选题", user)
+        self.assertIn("- 普娃逆袭", user)
+        self.assertIn("优先给新角度", user)
+
+    def test_xiaoti_quota_adaptive_small_count(self):
+        with mock.patch("brain.experts.xiaoti.load_used", return_value=[]):
+            fg = FakeGen()
+            XiaotiExpert(generate=fg).handle("出1个选题")
+            small = fg.calls[0][1]
+            XiaotiExpert(generate=fg).handle("帮我出5个选题")
+            big = fg.calls[1][1]
+        self.assertIn("随机选一类或两类", small)
+        self.assertNotIn("尽量兼顾", small)
+        self.assertIn("尽量兼顾", big)
+        self.assertNotIn("随机选一类或两类", big)
 
     def test_xiaone_prompt_has_confirmed_rules(self):
         fg = FakeGen()

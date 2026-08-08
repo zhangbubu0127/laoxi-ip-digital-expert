@@ -5,6 +5,7 @@ from brain.material import recent_materials
 from brain.market import intel as market_intel
 from brain.rules import render_rules
 from brain.reflow import load_conclusions
+from brain.used_topics import load_used
 from brain.experts.base import Expert
 
 class XiaotiExpert(Expert):
@@ -16,15 +17,13 @@ class XiaotiExpert(Expert):
     def handle(self, task: str, context: str = "") -> str:
         system = self._system()
         n = _extract_count(task)
-        quota = f"本批约 {n} 条，" if n else ""
         user = (f"基于以上知识库，{task}。\n"
-                f"【取材配额】{quota}选题必须一半取材于【竞对情报/市场热点】段，"
-                "另一半取材于本地知识库（【爆款规律】【家长原话】【家长典型问题清单】【素材库】）；"
-                "禁止全部来自单一来源；竞对类选题不得独占热点那一半（热点段内也要热点/竞对/中新对比均衡取材）。\n"
+                f"【取材配额】{_quota_section(n)}\n"
+                f"{_used_block()}"
                 "先列选题，每条一行：序号.【类型】选题名（只要标题和角度，简洁，不带依据）；\n"
-                "最后另起一行用「【依据】」开段，下面逐条写每个选题的理由（家长原话/爆款规律依据，能引用的尽量引用）；"
-                "每条依据开头用括号标注取材来源（来源：市场热点 / 来源：竞对 / 来源：知识库）。\n"
-                "【依据】段第 N 条必须就是上面第 N 条选题的理由，序号一致、严格一一对应，禁止调换顺序或张冠李戴。")
+                "最后另起一行用「【依据】」开段，下面给每条选题配一条理由（多个取材来源的支撑可合并进同一条，别为凑来源拆条）；"
+                "依据尽量按序号与选题一一对应（第 N 条理由=第 N 条选题），张冠李戴会显得不专业；"
+                "每条依据开头用括号标注取材来源（来源：市场热点 / 来源：竞对 / 来源：知识库）。")
         if context:
             user += f"\n\n【上文对话（供理解指代、避免重复）】\n{context}"
         return self._generate(system, user)
@@ -62,7 +61,7 @@ class XiaotiExpert(Expert):
             "- 建议的下一步若需要执行（老板点头就能做），把动作名用【】括进建议句：例「要不要我【重新出选题】按预算对比方向出3个？」；动作名限：重新出选题/写脚本/审核脚本。\n"
             "- 每条选题必须带类型标签（曝光/留资/信任），角度须有知识库依据，不空想。\n"
             "- 大白话，家长听得懂；禁用「底层规划逻辑」「行业地位」这类家长不关心的词。\n"
-            "- 输出格式：先序号.【类型】选题名（不带依据），末尾用一行「【依据】」开段，下面逐条列理由，与上方选题按同一序号严格一一对应（第 N 条理由=第 N 条选题），禁止调换。\n"
+            "- 输出格式：先序号.【类型】选题名（不带依据），末尾用一行「【依据】」开段，下面逐条列理由，尽量与上方选题按同一序号一一对应。\n"
             "\n"
             "【理解老板的话（举例）】\n"
             "- 老板说「别老出留资的，出几个能拉曝光的」→ 不是闲聊，是要求：类型换曝光，数量照旧。\n"
@@ -95,3 +94,21 @@ class XiaotiExpert(Expert):
 def _extract_count(task: str) -> int:
     m = re.search(r"(\d+)\s*[个条]", task)
     return int(m.group(1)) if m else 0
+
+def _quota_section(n: int) -> str:
+    exact = f"本批正好 {n} 条，选题数量必须严格等于 {n}，" if n else ""
+    if n and n < 3:
+        # 数量少时硬拆三类来源会把单个选题硬凑多条（10:28 依据拆条根因）→ 随机一类/两类取材
+        return (f"{exact}本题数量较少，不要求三类来源各占——从【市场热点/竞对】与本地知识库两类中随机选一类或两类取材即可；"
+                "每个选题只写一条依据，不要为了凑来源把单个选题拆成多条。")
+    return (f"{exact}取材尽量兼顾【竞对情报/市场热点】与本地知识库（【爆款规律】【家长原话】"
+            "【家长典型问题清单】【素材库】）两侧，别清一色只用一个来源；"
+            "热点段内也尽量让热点/竞对/中新对比均衡取材。")
+
+def _used_block() -> str:
+    recent = load_used()[-30:]
+    if not recent:
+        return ""
+    lines = "\n".join(f"- {t}" for t in recent)
+    return (f"【已用选题（此前被采用过，出题时优先给新角度；实在没有新角度才可复用，且不得原样照搬标题）】\n"
+            f"{lines}\n")

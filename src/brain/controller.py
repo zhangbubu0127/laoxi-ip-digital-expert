@@ -2,32 +2,63 @@ import datetime, json, re, time
 from log import get_logger
 from pipe import InboundMessage, OutboundMessage
 from brain.circuit import CircuitBreaker
-from brain.intent import recognize, by_keyword, IntentResult, WRITE_SCRIPT_HINTS
+from brain.intent import by_keyword, WRITE_SCRIPT_HINTS
+from brain.planner import PlanResult, plan as _planner_call
 from brain.session import store, render_history
 from brain import material, rules
-from brain.scheduler import mark_published, render_schedule, add_entry, load_schedule, record_data
+from brain.knowledge import style_users
+from brain.scheduler import mark_published, render_schedule, add_entry, load_schedule, record_data, confirm_publish
+from brain.used_topics import load_used, add_used
 from brain.experts.xiaoti import XiaotiExpert
 from brain.experts.xiaowen import XiaowenExpert
 from brain.experts.xiaone import XiaoneExpert, split_review
 from brain.experts.xiaoxi import XiaoxiExpert
 from brain.experts.fupan import FupanExpert
-from brain.experts.dispatch import run_expert, EXPLAIN_MARK, LEARN_MARK
+from brain.experts.dispatch import run_expert, EXPLAIN_MARK, LEARN_MARK, parse_learned_rules
 from brain import context_store, market
-from skin import bots, identity
+from skin import bots, identity, base_bridge
 
 _b = CircuitBreaker()
 _log = get_logger("controller")
-_ADMIN_ONLY = ("出选题", "写脚本", "审核脚本", "改排期", "看排期表", "反馈修改", "追问", "记素材", "看完整讨论", "圆桌讨论", "学规则", "确认规则", "数据回流", "更新市场情报")
 _EXPERT_ROLES = ("席小题", "席小文", "席小核", "席小习", "席小盘")
+_USED_HINT = "出题时会优先避开/降权已用选题；想看历史用过的选题，跟我说「看已用选题」。"
 
-def _fallback_recognize(content: str, history_text: str = "") -> IntentResult:
+# 动作级权限（替代旧的意图级 _ADMIN_ONLY）：写操作仅老板/产品，用户只读
+_PERMISSION_ADMIN = frozenset((
+    "出选题", "写脚本", "审核脚本", "改排期", "改表格结构", "记素材", "圆桌讨论",
+    "学规则", "确认规则", "数据回流", "更新市场情报", "改审核看法",
+))
+_PERMISSION_USER_READONLY = frozenset((
+    "看排期表", "看完整讨论", "查记录", "查已用选题", "反馈修改", "追问", "要审核理由",
+))
+# 第三角色桶：确认已发布（发片同事可做）、确认排期/专家闲聊（任何人）
+_THIRD_BUCKET = frozenset(("确认已发布", "确认排期", "专家闲聊"))
+
+# LLM 规划器崩溃时关键词兜底：by_keyword 意图名 → planner 动作名（大多同名）
+_INTENT_TO_ACTION = {
+    "出选题": "出选题", "写脚本": "写脚本", "审核脚本": "审核脚本", "看排期表": "看排期表",
+    "改排期": "改排期", "改表格结构": "改表格结构", "确认已发布": "确认已发布", "确认排期": "确认排期",
+    "反馈修改": "反馈修改", "追问": "追问", "记素材": "记素材", "看完整讨论": "看完整讨论",
+    "查记录": "查记录", "查已用选题": "查已用选题", "圆桌讨论": "圆桌讨论", "学规则": "学规则",
+    "确认规则": "确认规则", "数据回流": "数据回流", "更新市场情报": "更新市场情报",
+}
+
+def _fallback_planner(msg: InboundMessage, content: str, history_text: str, rounds: list) -> PlanResult | None:
+    # planner LLM 崩溃时降级：关键词兜底（保高信号指令不静默）；再兜不住返回 None（走老对话模板）
     try:
-        return recognize(content, history_text)
+        return _planner_call(content, history_text=history_text,
+                             mention_names=list(msg.mention_names),
+                             step=_pipelines.get(msg.chat_id, {}).get("step", ""),
+                             review_head=_review_head(msg.chat_id))
     except Exception as e:
-        _log.error("意图识别失败，降级关键词路由: %s", e)
-        return by_keyword(content)
+        _log.error("规划器调用失败，降级关键词路由: %s", e)
+    result = by_keyword(content)
+    action = _INTENT_TO_ACTION.get(result.intent)
+    if action:
+        return PlanResult(reply="", action=action, task=content, params=result.params)
+    return None
 
-_recognize = _fallback_recognize
+_planner = _fallback_planner
 _pull_history = None  # 皮肤层启动时注入；大脑层不直接调 lark-cli
 _emit = None  # 皮肤层注入的即时发送接缝；大脑层不直接调 lark-cli
 _context_put = context_store.put  # 派单上下文写入共享文件（测试可替换，避免落盘）
@@ -51,7 +82,7 @@ def _default_chat_generate(content: str, history_text: str = "") -> str:
         "【行动】{\"action\":\"<动作>\",\"task\":\"<具体任务>\",\"when\":\"立即|待确认\"}\n"
         "动作白名单：\n"
         "- 核对选题记录（立即）：系统会真读选题存档/会话记忆，把回执补到你回复后面。\n"
-        "- 看排期表（立即）：系统会把当前排期表补到你回复后面。\n"
+        "- 看排期表（立即）：直接把多维表格链接给出来，不渲染整张表。\n"
         "- 重新出选题/出选题（待确认）：派席小题。task 写清数量+角度。\n"
         "- 写脚本（待确认）：派席小文+席小核。task 写清选题。\n"
         "- 审核脚本（待确认）：派席小核。\n"
@@ -106,14 +137,14 @@ def _register_actions(chat_id: str, text: str, rounds: list, replies: list) -> N
             _register_action_pending(chat_id, action, task)
 
 def _register_action_pending(chat_id: str, action: str, task: str) -> None:
-    intent = _ACTION_INTENTS.get(action)
-    if not intent:
+    action = _ACTION_ALIASES.get(action, action)
+    if action not in _ACTION_EXECUTORS:
         _log.info("行动未登记：未知动作 %s", action)
         return
-    if intent == "出选题":
+    if action == "出选题":
         task = task or "重新出一版选题"
-    _pending_action[chat_id] = {"intent": intent, "params": {}, "task": task, "ts": time.time()}
-    _log.info("登记待定动作 chat=%s intent=%s task=%r", chat_id, intent, task)
+    _pending_action[chat_id] = {"action": action, "task": task, "ts": time.time()}
+    _log.info("登记待定动作 chat=%s action=%s task=%r", chat_id, action, task)
 
 def _run_immediate(chat_id: str, action: str, task: str, rounds: list, replies: list) -> None:
     """小席承诺当场兑现的动作：真去读记录/排期，把回执补进回复，不空头承诺。"""
@@ -122,29 +153,28 @@ def _run_immediate(chat_id: str, action: str, task: str, rounds: list, replies: 
         if reply:
             replies.append(OutboundMessage(chat_id, reply, "小席"))
     elif action in ("看排期表",):
-        replies.append(OutboundMessage(chat_id, "当前排期表：\n" + render_schedule() + _base_link(), "小席"))
+        replies.append(OutboundMessage(chat_id, _schedule_reply(), "小席"))
 
 def _register_expert_proposal(chat_id: str, text: str) -> None:
     """专家回复里带【动作名】的建议下一步 → 登记待确认动作，老板点头即执行。"""
     m = _EXPERT_ACTION_RE.search(text or "")
     if not m:
         return
-    action = m.group(1)
-    intent = _ACTION_INTENTS.get(action)
-    if not intent:
+    action = _ACTION_ALIASES.get(m.group(1), m.group(1))
+    if action not in _ACTION_EXECUTORS:
         return
     line = next((l for l in text.split("\n") if m.group(0) in l), "")
     task = line.split(m.group(0), 1)[-1].strip(" ？?！!。，,；;")
-    if intent == "出选题":
+    if action == "出选题":
         task = task or "重新出一版选题"
-    _pending_action[chat_id] = {"intent": intent, "params": {}, "task": task, "ts": time.time()}
-    _log.info("专家提议登记 chat=%s intent=%s task=%r", chat_id, intent, task)
+    _pending_action[chat_id] = {"action": action, "task": task, "ts": time.time()}
+    _log.info("专家提议登记 chat=%s action=%s task=%r", chat_id, action, task)
 
 def _strip_action_lines(text: str) -> str:
     return _ACTION_RE.sub("", text or "").strip()
 
 _PROPOSAL_RE = re.compile(r"【提议】\s*([^：:]+?)\s*[：:]\s*(.*)")
-_PROPOSAL_INTENTS = (("重新出选题", "出选题"), ("重新整理", "出选题"), ("重新出一版", "出选题"),
+_PROPOSAL_ACTIONS = (("重新出选题", "出选题"), ("重新整理", "出选题"), ("重新出一版", "出选题"),
                      ("出个选题", "出选题"), ("出条选题", "出选题"), ("出选题", "出选题"),
                      ("写条脚本", "写脚本"), ("写条", "写脚本"), ("写脚本", "写脚本"), ("出文案", "写脚本"), ("文案", "写脚本"),
                      ("审核", "审核脚本"), ("审一遍", "审核脚本"), ("复审", "审核脚本"),
@@ -152,36 +182,61 @@ _PROPOSAL_INTENTS = (("重新出选题", "出选题"), ("重新整理", "出选�
 
 # 「说话即行动」契约：小席聊天回复末尾的机器可执行行动行（行首锚定，避免正文误配）
 _ACTION_RE = re.compile(r"^【行动】\s*(\{.*\})\s*$", re.M)
-_ACTION_INTENTS = {
-    "重新出选题": "出选题", "重新整理选题": "出选题", "重新出一版": "出选题", "出选题": "出选题",
-    "写脚本": "写脚本", "写条脚本": "写脚本", "出条脚本": "写脚本",
-    "审核脚本": "审核脚本", "审核": "审核脚本", "审一遍": "审核脚本", "复审": "审核脚本",
+_ACTION_ALIASES = {
+    "重新出选题": "出选题", "重新整理选题": "出选题", "重新出一版": "出选题",
+    "写条脚本": "写脚本", "出条脚本": "写脚本", "出文案": "写脚本",
+    "审核": "审核脚本", "审一遍": "审核脚本", "复审": "审核脚本",
 }
 # 专家回复里建议下一步用的可读标记：把动作名用【】括进建议句，主控识别后登记待确认动作，老板点头即执行
-_EXPERT_ACTION_RE = re.compile(r"【(重新出选题|重新整理选题|重新出一版|出选题|写脚本|写条脚本|出条脚本|审核脚本|审核)】")
+_EXPERT_ACTION_RE = re.compile(r"【(重新出选题|重新整理选题|重新出一版|出选题|写脚本|写条脚本|出条脚本|审核脚本|审核|看排期表)】")
 
 def _register_proposal(chat_id: str, text: str) -> None:
     m = _PROPOSAL_RE.search(text or "")
     if not m:
         return
     action, detail = m.group(1).strip(), m.group(2).strip()
-    for kw, intent in _PROPOSAL_INTENTS:
+    for kw, action_name in _PROPOSAL_ACTIONS:
         if kw in action:
             task = detail
-            if intent == "出选题":
+            if action_name == "出选题":
                 task = task or "重新出一版选题"
-            _pending_action[chat_id] = {"intent": intent, "params": {}, "task": task, "ts": time.time()}
-            _log.info("登记待定动作 chat=%s intent=%s task=%r", chat_id, intent, task)
+            _pending_action[chat_id] = {"action": action_name, "task": task, "ts": time.time()}
+            _log.info("登记待定动作 chat=%s action=%s task=%r", chat_id, action_name, task)
             return
 
 def _strip_proposal_marker(text: str) -> str:
     return re.sub(r"【提议】.*", "", text or "").strip()
 
-def _write_script(msg: InboundMessage, content: str, task: str, rounds: list, replies: list) -> None:
+_STYLE_REQ_RE = re.compile(r"(?:按|用)\s*([^的，。:：、\s]{1,10})\s*的风格")
+
+def _requested_style(text: str) -> str:
+    # 老板在写脚本指令里直接点名风格（「按张艺宝的风格写」）→ 命中即用，省一次反问
+    m = _STYLE_REQ_RE.search(text or "")
+    if not m:
+        return ""
+    name = m.group(1).strip()
+    return name if name in style_users() else ""
+
+def _write_script(msg: InboundMessage, content: str, task: str, rounds: list, replies: list, params: dict | None = None) -> None:
+    params = params or {}
+    if msg.sender_open_id:
+        _requester_by_chat[msg.chat_id] = msg.sender_open_id
+    users = style_users()
+    explicit = _requested_style(content) or _requested_style(task)
+    if explicit in users:
+        _last_style[msg.chat_id] = explicit
+    elif len(users) > 1 and _last_style.get(msg.chat_id) not in users:
+        # 多个风格库且本次没指定 → 问老板用谁的，等答复后再落笔（绝不默认瞎猜）
+        _pipelines[msg.chat_id] = {"step": "wait_style", "content": content, "task": task,
+                                   "params": params, "ts": time.time()}
+        _post(msg.chat_id, replies, "小席",
+              f"这次写脚本按谁的风格来？当前可用：{'/'.join(users)}。回一个人名即可（默认老席）。")
+        return
     topic, ctype = _pipe_ctx(msg.chat_id, content, rounds, task)
     if topic:
         _draft_ctx[msg.chat_id] = (topic, ctype)
     task = _resolve_script_task(task, content, rounds, msg.chat_id)
+    task = _apply_script_count(task, content, params)
     _log.info("派单 席小文 + 席小核")
     _post(msg.chat_id, replies, "小席", "写脚本进行中：席小文写作 → 席小核审核，两段约30-60秒…")
     wen = _dispatch_expert(msg.chat_id, replies, "席小文", task or content, _recent_context(rounds))
@@ -195,6 +250,21 @@ def _write_script(msg: InboundMessage, content: str, task: str, rounds: list, re
         else:
             _post_xiaone(msg.chat_id, replies, he)
             _post(msg.chat_id, replies, "小席", "写脚本流水线完成：席小文出稿 + 席小核审核已展示，要改直接说。")
+
+def _resolve_style(msg: InboundMessage, content: str, rounds: list, replies: list) -> None:
+    # 老板回答「按谁风格写」：登记该风格 → 用原请求重新派单
+    pipe = _pipelines.get(msg.chat_id)
+    if not pipe or pipe.get("step") != "wait_style":
+        return
+    matched = next((u for u in style_users() if u in content), "")
+    if not matched:
+        _post(msg.chat_id, replies, "小席",
+              f"没认出这个风格，当前可用：{'/'.join(style_users())}。回一个人名（如「老席」）。")
+        return
+    _pipelines.pop(msg.chat_id, None)
+    _last_style[msg.chat_id] = matched
+    _post(msg.chat_id, replies, "小席", f"好，这次按「{matched}」的风格写。")
+    _write_script(msg, pipe.get("content", ""), pipe.get("task", ""), rounds, replies, pipe.get("params"))
 
 def _post_xiaone(chat_id: str, replies: list, text: str) -> None:
     # 席小核输出含公开结论 + 详情段：公开发群，详情存档（老板要理由才展示）
@@ -212,6 +282,19 @@ def _resolve_script_task(task: str, content: str, rounds: list, chat_id: str = "
     if not topic:
         return task or content
     return f"写「{topic}」这条的脚本"
+
+
+def _apply_script_count(task: str, content: str, params: dict) -> str:
+    # 意图层提取出的 count（如「出两个脚本」的 2）要写进派单任务，否则席小文只按「写这条」出一稿
+    count = params.get("count")
+    if not count:
+        return task
+    n = _to_int(str(count))
+    if n <= 1 or re.search(rf"{n}\s*条", task or ""):
+        return task
+    base = (task or content).strip()
+    return (f"{base}。本批共 {n} 条脚本，围绕该选题写出 {n} 条不同角度/版本的脚本，"
+            f"逐条完整输出，每条以## 脚本 标题 开头")
 
 
 def _topic_by_index(n: int, rounds: list, chat_id: str = "") -> str:
@@ -284,7 +367,10 @@ _REASON_YES = ("要", "要吧", "要的", "可以", "好的", "行", "看看", "
 _pipelines = {}  # chat_id -> 异步编排状态（写脚本/圆桌/数据回流）
 _draft_ctx = {}  # chat_id -> (topic, content_type)：最近一次写脚本任务对应的选题，定稿时升格为 _last_passed
 _last_passed = {}  # chat_id -> {"topic", "content_type"}：最近一次定稿的选题，供「这条选题通过了/排期发布」追溯
-_pending_action = {}  # chat_id -> {"intent", "params", "task", "ts"}：小席提议待老板点头后真执行的动作
+_pending_action = {}  # chat_id -> {"action", "task", "ts"}：小席提议待老板点头后真执行的动作
+_last_style = {}  # chat_id -> 风格用户：最近一次写脚本用的说话风格（多个风格库时小席先问，之后复用）
+_requester_by_chat = {}  # chat_id -> 真人 open_id：发起写脚本流水线的人，定稿/审核疑问时针对性 @ 他，不泛问
+_used_cursor = {}  # chat_id -> 已用选题分页已展示到的下标：查已用选题时按 10 条一页续发
 
 def _controller_factories() -> dict:
     return {
@@ -292,8 +378,11 @@ def _controller_factories() -> dict:
         "席小习": XiaoxiExpert, "席小盘": FupanExpert,
     }
 
+_SCRIPT_HEADER_RE = re.compile(r"^(?:【席小文】)?\s*#+\s*脚本(?:\s*v\d+)?\s*[：:]\s*(.*)$", re.M)
+
 def _is_script_output(text: str) -> bool:
-    return text.startswith("【席小文】") and "## 脚本" in text
+    # 脚本以「## 脚本 vX：标题」开头（历史数据可带【席小文】前缀，均识别为正式出稿）
+    return bool(_SCRIPT_HEADER_RE.search(text or ""))
 
 def _last_script(rounds: list) -> str:
     # 找会话记忆里最近一条席小文脚本产出，供老板「审核一下」时派席小核
@@ -315,6 +404,11 @@ def _review_script(msg: InboundMessage, content: str, rounds: list, replies: lis
         _post_xiaone(msg.chat_id, replies, he)
 
 def _dispatch_expert(chat_id: str, replies: list, role: str, task: str, context: str = ""):
+    # 写作/学习按该聊天的风格用户随行派单：非老席时在任务开头带风格指令，专家bot据此换风格/分库学习
+    if role in ("席小文", "席小习"):
+        su = _last_style.get(chat_id, "老席")
+        if su != "老席":
+            task = f"【风格:{su}】{task}"
     try:
         bot = bots.by_role(role)
     except KeyError:
@@ -334,6 +428,11 @@ def handle_bot_output(msg: InboundMessage) -> list:
     """主控收到专家 bot 消息：写入会话记忆并推进异步流水线。"""
     replies = []
     store.add_round(msg.chat_id, [{"speaker": msg.sender_role, "text": msg.content}])
+    # 任意席小核产出都覆盖审核详情存档（不只 wait_he 态），保证「要理由」读到的始终是最近一次审核，而非旧存档
+    if msg.sender_role == "席小核":
+        _pub, _det = split_review(msg.content)
+        if _det:
+            context_store.save_review(msg.chat_id, "席小核", _det)
     pipe = _pipelines.get(msg.chat_id)
     role = msg.sender_role
     if pipe is None:
@@ -361,9 +460,6 @@ def handle_bot_output(msg: InboundMessage) -> list:
             _post(msg.chat_id, replies, "小席", "写脚本流水线完成：席小文出稿 + 席小核审核已展示，要改直接说。")
     elif step == "wait_he" and role == "席小核":
         verdict = _verdict_classify(msg.content)
-        public, details = split_review(msg.content)
-        if details:
-            context_store.save_review(msg.chat_id, "席小核", details)
         rounds_fix = pipe.get("fix_rounds", 0)
         if verdict == "fail" and rounds_fix < _MAX_FIX_ROUNDS:
             _log.info("写脚本流水线 审核未过→席小文修改（第%d轮）", rounds_fix + 1)
@@ -386,13 +482,12 @@ def handle_bot_output(msg: InboundMessage) -> list:
             _pipelines[msg.chat_id] = {"step": "wait_boss", "script": pipe["script"],
                                        "reviewer": msg.content, "fix_rounds": rounds_fix, "ts": time.time()}
             _post(msg.chat_id, replies, "小席",
-                  f"{_admin_at_mentions()}席小核审核有疑问，需要您定夺：\n{_cap(msg.content, 240)}\n"
+                  f"{_requester_mention(msg.chat_id) or _admin_at_mentions()}席小核审核有疑问，需要您定夺：\n{_cap(msg.content, 240)}\n"
                   "给个确定答案（例：费用按8万没问题 / 这句删掉），我会让席小核记住、席小文按答案修改再复审；\n"
                   "回「可以了/继续」＝按当前脚本通过定稿；回「不用了」＝取消本次修改。")
         else:
             _record_passed(msg.chat_id)
-            _pipelines.pop(msg.chat_id, None)
-            _post(msg.chat_id, replies, "小席", "写脚本流水线完成：席小文出稿 + 席小核审核通过，要改直接说。")
+            _ask_schedule(msg.chat_id, pipe["script"], replies)
     elif step == "wait_fix" and role == "席小文":
         _log.info("写脚本流水线 wait_fix→wait_he（复审）")
         he = _dispatch_expert(msg.chat_id, replies, "席小核", "审核这条脚本", f"【脚本原文】\n{msg.content}")
@@ -408,6 +503,11 @@ def handle_bot_output(msg: InboundMessage) -> list:
         if not pipe["waiting"]:
             _pipelines.pop(msg.chat_id, None)
             _post(msg.chat_id, replies, "小席", _roundtable_summary(pipe))
+    elif step == "wait_topic" and role == "席小题" and not _is_probe(msg.content):
+        # 席小题产出回来：pop 掉等待态、补发已用选题提醒（探询句不算产出，等真正选题正文）
+        _pipelines.pop(msg.chat_id, None)
+        _register_expert_proposal(msg.chat_id, msg.content)
+        _post(msg.chat_id, replies, "小席", _USED_HINT)
     elif step == "wait_fupan" and role == "席小盘":
         conclusion = msg.content
         _pipelines.pop(msg.chat_id, None)
@@ -433,6 +533,17 @@ def sweep_pipelines() -> list:
             _post(cid, replies, "小席",
                   f"{at}席小核审核的疑问还在等您拍板：\n{_cap(p.get('reviewer', ''), 120)}\n"
                   "给个确定答案；回「可以了/继续」按当前脚本通过；回「不用了」取消。")
+            continue
+        if p.get("step") == "wait_schedule":
+            # 排期询问超时：脚本已交付，不催，安静撤掉等待态，随时可再排
+            _post(cid, replies, "小席", "上排期的事先放着，要排随时说一声（给我日期时间就行）。")
+            continue
+        if p.get("step") == "wait_topic":
+            # 出题产出超时：席小题已自发群展示选题，不补提醒，安静撤掉等待态
+            continue
+        if p.get("step") == "wait_style":
+            # 风格询问超时：不催，安静撤掉，下次写脚本默认老席（要指定直接说「按XX的风格写」）
+            _post(cid, replies, "小席", "选风格的事先放着，下次写脚本我按默认来，要指定直接说「按XX的风格写」。")
             continue
         if p.get("step") == "roundtable":
             views = "\n".join(f"- {r}: {_cap(v)}" for r, v in p["views"])
@@ -478,95 +589,223 @@ def _pop_pending(chat_id: str) -> dict | None:
     _pending_action.pop(chat_id, None)
     return pending
 
-def _route_intent(msg: InboundMessage, result: IntentResult, rounds: list, replies: list) -> None:
-    intent = result.intent
-    content = msg.content
-    if intent == "出选题":
-        if not (result.task or result.params.get("count") or result.params.get("topic")):
-            replies.append(OutboundMessage(msg.chat_id, "出选题可以。想让我出几个、从哪个角度出？（比如：3个，预算对比）", "小席"))
-        else:
-            _log.info("派单 席小题")
-            task = (result.task or "").strip() or _topic_task(result.params)
-            out = _dispatch_expert(msg.chat_id, replies, "席小题", task, _xiaoti_context(content, rounds, msg.chat_id))
-            if out is not None:
-                replies.append(OutboundMessage(msg.chat_id, out, "席小题"))
-    elif intent == "写脚本":
-        _write_script(msg, content, (result.task or "").strip(), rounds, replies)
-    elif intent == "审核脚本":
-        _review_script(msg, content, rounds, replies)
-    elif intent == "看排期表":
-        replies.append(OutboundMessage(msg.chat_id, "当前排期表：\n" + render_schedule() + _base_link(), "小席"))
-    elif intent == "改排期":
-        picked = _try_pick_topic(content, result.params, rounds, msg.chat_id)
-        if picked is not None:
-            add_entry(picked)
+_USED_PAGE_SIZE = 10
+_USED_MORE = "继续发就说「继续」，够了就说「不用了」。"
+_USED_CONTINUE_WORDS = ("继续", "接着", "再来", "还有", "下一页")
+_USED_STOP_WORDS = ("不用", "够了", "停", "不看了", "好了", "可以了", "结束")
+
+def _send_used_page(chat_id: str, replies: list, start: int) -> None:
+    used = load_used()
+    if not used:
+        replies.append(OutboundMessage(chat_id, "已用选题库还是空的——还没有选题被排上排期表。", "小席"))
+        _used_cursor.pop(chat_id, None)
+        return
+    page = used[start:start + _USED_PAGE_SIZE]
+    lines = "\n".join(f"{i + 1}. {t}" for i, t in enumerate(page, start=start))
+    total = len(used)
+    n = start + len(page)
+    body = f"已用选题（共{total}条，第{start // _USED_PAGE_SIZE + 1}页）：\n{lines}"
+    if n < total:
+        body += f"\n{_USED_MORE}"
+        _used_cursor[chat_id] = n
+    else:
+        body += "\n已全部展示已选用选题。"
+        _used_cursor.pop(chat_id, None)
+    replies.append(OutboundMessage(chat_id, body, "小席"))
+
+def _review_head(chat_id: str) -> str:
+    # 传给规划器的最近一次席小核审核首行，供判断「老板是不是在纠正审核看法」用；无存档则空
+    details = context_store.load_review(chat_id, "席小核")
+    if not details:
+        return ""
+    return details.strip().split("\n", 1)[0][:120]
+
+def _exec_topics(msg: InboundMessage, content: str, task: str, rounds: list, replies: list, params: dict | None = None) -> None:
+    params = params or {}
+    if not (task or params.get("count") or params.get("topic")):
+        replies.append(OutboundMessage(msg.chat_id, "出选题可以。想让我出几个、从哪个角度出？（比如：3个，预算对比）", "小席"))
+        return
+    _log.info("派单 席小题")
+    t = (task or "").strip() or _topic_task(params)
+    out = _dispatch_expert(msg.chat_id, replies, "席小题", t, _xiaoti_context(content, rounds, msg.chat_id))
+    if out is not None:
+        replies.append(OutboundMessage(msg.chat_id, out, "席小题"))
+        _post(msg.chat_id, replies, "小席", _USED_HINT)
+    else:
+        _pipelines[msg.chat_id] = {"step": "wait_topic", "ts": time.time()}
+
+def _exec_view_schedule(msg: InboundMessage, content: str, task: str, rounds: list, replies: list, params: dict | None = None) -> None:
+    replies.append(OutboundMessage(msg.chat_id, _schedule_reply(), "小席"))
+
+def _exec_used_topics(msg: InboundMessage, content: str, task: str, rounds: list, replies: list, params: dict | None = None) -> None:
+    _send_used_page(msg.chat_id, replies, 0)
+
+def _exec_change_schedule(msg: InboundMessage, content: str, task: str, rounds: list, replies: list, params: dict | None = None) -> None:
+    params = params or {}
+    picked = _try_pick_topic(content, params, rounds, msg.chat_id)
+    if picked is not None:
+        add_entry(picked)
+        add_used(picked["topic"])
+        replies.append(OutboundMessage(msg.chat_id,
+            f"已排上：{picked['date']} {picked['publish_time']} 发「{picked['topic']}」（类型：{picked['content_type']}）" + _base_link(), "小席"))
+    elif any(w in content for w in _PASSED_HINTS):
+        # 老板确认「这条选题/排期发布」但没追溯到刚定稿的选题（如进程重启）→ 明说失败，绝不生成占位
+        replies.append(OutboundMessage(msg.chat_id,
+            "没找到刚定稿的选题（可能刚重启或脚本还没走完审核）。请直接说「排上第1个」指定具体选题，或重新写一条脚本。", "小席"))
+    else:
+        # 空参数 + 内容里没有明确排期信息 → 绝不编占位行，问老板要具体排期
+        explicit = any(params.get(k) for k in ("count", "date", "publish_time", "topic"))
+        if not explicit and not re.search(
+                r"(今天|明天|下周|下星期|星期|周[一二三四五六日]|\d{1,2}/\d{1,2}|个\s*(曝光|信任|留资)|排期)", content):
             replies.append(OutboundMessage(msg.chat_id,
-                f"已排上：{picked['date']} {picked['publish_time']} 发「{picked['topic']}」（类型：{picked['content_type']}）\n" + render_schedule() + _base_link(), "小席"))
-        elif any(w in content for w in _PASSED_HINTS):
-            # 老板确认「这条选题/排期发布」但没追溯到刚定稿的选题（如进程重启）→ 明说失败，绝不生成占位
-            replies.append(OutboundMessage(msg.chat_id,
-                "没找到刚定稿的选题（可能刚重启或脚本还没走完审核）。请直接说「排上第1个」指定具体选题，或重新写一条脚本。", "小席"))
+                "你要排哪条选题、排哪天几点？说清楚（如「把第1个排到下周三 12:00」），我马上排。", "小席"))
         else:
-            entries = _schedule_entries(result.params, content)
+            entries = _schedule_entries(params, content)
             for e in entries:
                 add_entry(e)
-            replies.append(OutboundMessage(msg.chat_id, f"已排{len(entries)}条：\n" + render_schedule() + _base_link(), "小席"))
-    elif intent == "记素材":
-        _log.info("记素材入库")
-        replies.append(OutboundMessage(msg.chat_id, _record_material(content), "小席"))
-    elif intent == "看完整讨论":
-        hist = _history_context(msg.chat_id)
+            replies.append(OutboundMessage(msg.chat_id, f"已排{len(entries)}条：" + _base_link(), "小席"))
+
+def _exec_table_column(msg: InboundMessage, content: str, task: str, rounds: list, replies: list, params: dict | None = None) -> None:
+    _log.info("改表格结构 → 加列")
+    replies.append(OutboundMessage(msg.chat_id, _add_table_column(content), "小席"))
+
+def _exec_record_material(msg: InboundMessage, content: str, task: str, rounds: list, replies: list, params: dict | None = None) -> None:
+    _log.info("记素材入库")
+    replies.append(OutboundMessage(msg.chat_id, _record_material(content), "小席"))
+
+def _exec_history(msg: InboundMessage, content: str, task: str, rounds: list, replies: list, params: dict | None = None) -> None:
+    hist = _history_context(msg.chat_id)
+    replies.append(OutboundMessage(msg.chat_id,
+                                   "最近群讨论：\n" + hist if hist else "完整讨论拉取未接入或暂无",
+                                   "小席"))
+
+def _exec_lookup_record(msg: InboundMessage, content: str, task: str, rounds: list, replies: list, params: dict | None = None) -> None:
+    _log.info("查记录 → 真核对回执")
+    record_reply = _lookup_topic_record(msg.chat_id, content, rounds, replies, force=True)
+    if record_reply:
+        replies.append(OutboundMessage(msg.chat_id, record_reply, "小席"))
+
+def _exec_review_reasons(msg: InboundMessage, content: str, task: str, rounds: list, replies: list, params: dict | None = None) -> None:
+    _log.info("要审核理由 → 直发存档详情")
+    reason = _show_review_reasons(msg.chat_id, content, rounds)
+    if reason:
+        replies.append(OutboundMessage(msg.chat_id, reason, "席小核"))
+
+def _exec_mark_published(msg: InboundMessage, content: str, task: str, rounds: list, replies: list, params: dict | None = None) -> None:
+    ok = _try_mark_published(content)
+    replies.append(OutboundMessage(msg.chat_id, f"已发状态：{ok}", "小席"))
+
+def _exec_confirm_publish(msg: InboundMessage, content: str, task: str, rounds: list, replies: list, params: dict | None = None) -> None:
+    ok = confirm_publish(msg.chat_id)
+    replies.append(OutboundMessage(msg.chat_id,
+                                   "已确认，这条排期不再提醒。" if ok else "没有需要确认的发布提醒。", "小席"))
+
+def _exec_expert_chat(msg: InboundMessage, content: str, task: str, rounds: list, replies: list, params: dict | None = None) -> None:
+    target = task or next((n for n in msg.mention_names if n in _EXPERT_ROLES), "")
+    if not target:
+        return
+    _log.info("老板直接 @%s 闲聊，派单该角色自然接话", target)
+    out = _dispatch_expert(msg.chat_id, replies, target,
+                           f"老板在群里直接找你聊：{content}\n"
+                           "先自然共情接住老板的话，别摆架子；然后绕回你的本职工作，主动建议一个具体下一步。",
+                           _recent_context(rounds))
+    if out is not None:
+        _register_expert_proposal(msg.chat_id, out)
+        replies.append(OutboundMessage(msg.chat_id, out, target))
+
+def _exec_revise_review_rules(msg: InboundMessage, content: str, task: str, rounds: list, replies: list, params: dict | None = None) -> None:
+    # 老板纠正席小核审核判断/给审核标准 → 席小习提炼 → 直接落已确认规则（老板已拍板），下次审核自动对齐
+    su = _last_style.get(msg.chat_id, "老席")
+    speaker, prev = _last_any_output(rounds)
+    review = context_store.load_review(msg.chat_id, "席小核")
+    ctx = "\n\n".join(part for part in (
+        f"【最近一次席小核审核】\n{_cap(prev, 300)}" if speaker == "席小核" and prev else "",
+        f"【审核详情存档】\n{review}" if review else "",
+        _recent_context(rounds) or "",
+    ) if part)
+    _log.info("改审核看法 → 席小习提炼审核标准并直接落已确认规则")
+    task_text = f"{content}\n请把老板这段话里席小核要遵守的审核标准提炼成规则，直接给 JSON。"
+    style_prefix = f"【风格:{su}】" if su != "老席" else ""
+    try:
+        bot = bots.by_role("席小习")
+    except KeyError:
+        bot = None
+    if bot is not None and _emit is not None:
+        _context_put(msg.chat_id, "席小习", style_prefix + task_text, ctx)
+        _emit(msg.chat_id, f"<at user_id=\"{bot['open_id']}\"></at> {style_prefix}{task_text}", "席小习")
         replies.append(OutboundMessage(msg.chat_id,
-                                       "最近群讨论：\n" + hist if hist else "完整讨论拉取未接入或暂无",
-                                       "小席"))
-    elif intent == "查记录":
-        _log.info("查记录 → 真核对回执")
-        record_reply = _lookup_topic_record(msg.chat_id, content, rounds, replies, force=True)
-        if record_reply:
-            replies.append(OutboundMessage(msg.chat_id, record_reply, "小席"))
-    elif intent == "圆桌讨论":
-        _log.info("圆桌讨论 消息=%r", content[:60])
-        _roundtable(msg, content, result.params, rounds, replies)
-    elif intent == "反馈修改":
-        _revise(msg, content, rounds, replies)
-    elif intent == "追问":
-        _ask(msg, content, rounds, replies)
-    elif intent == "学规则":
-        _learn_rules(msg, content, rounds, replies)
-    elif intent == "确认规则":
-        _confirm_rules(msg, content, replies)
-    elif intent == "数据回流":
-        _reflow(msg, content, replies)
-    elif intent == "更新市场情报":
-        _refresh_market(msg, replies)
+            "收到老板的审核标准，已让席小习沉淀成规则，席小核下次审核自动对齐。", "小席"))
+        return
+    try:
+        text = _controller_factories()["席小习"]().handle(style_prefix + task_text, context=ctx)
+    except Exception as e:
+        _log.error("席小习提炼审核标准失败: %s", e)
+        replies.append(OutboundMessage(msg.chat_id,
+            f"收到老板的审核标准：\n{content}\n（席小习提炼失败，规则稍后再补）", "小席"))
+        return
+    pairs = parse_learned_rules(text)
+    if pairs:
+        for change, rule, rtype in pairs[:3]:
+            rules.add_confirmed_rule(change, rule, style_user=su, rtype=rtype)
+        body = "\n".join(f"- {rule}" for _, rule, _ in pairs[:3])
+        replies.append(OutboundMessage(msg.chat_id, f"已让席小核记住：\n{body}\n下次审核自动对齐。", "小席"))
     else:
-        record_reply = _lookup_topic_record(msg.chat_id, content, rounds, replies)
-        if record_reply:
-            _log.info("查选题记录 → 真核对回执")
-            replies.append(OutboundMessage(msg.chat_id, record_reply, "小席"))
-        else:
-            reason_reply = _show_review_reasons(msg.chat_id, content, rounds)
-            if reason_reply:
-                _log.info("老板要审核理由，直发存档详情")
-                replies.append(OutboundMessage(msg.chat_id, reason_reply, "席小核"))
-            else:
-                target = next((n for n in msg.mention_names if n in _EXPERT_ROLES), "")
-                if target:
-                    _log.info("老板直接 @%s 闲聊，派单该角色自然接话", target)
-                    out = _dispatch_expert(msg.chat_id, replies, target,
-                                           f"老板在群里直接找你聊：{content}\n"
-                                           "先自然共情接住老板的话，别摆架子；然后绕回你的本职工作，主动建议一个具体下一步。",
-                                           _recent_context(rounds))
-                    if out is not None:
-                        _register_expert_proposal(msg.chat_id, out)
-                        replies.append(OutboundMessage(msg.chat_id, out, target))
-                else:
-                    force = _force_script_task(content, rounds)
-                    if force:
-                        _log.info("意图识别落「其他」但命中产出指令，强制写脚本派单")
-                        _write_script(msg, content, force, rounds, replies)
-                    else:
-                        _chat_reply(msg, content, rounds, replies)
+        replies.append(OutboundMessage(msg.chat_id,
+            f"收到老板的审核标准：\n{content}\n已让席小核记住，下次审核按此对齐。", "小席"))
+
+# 动作名 → 执行器。签名统一 (msg, content, task, rounds, replies, params)。
+# 写脚本/审核/圆桌/追问/学规则等既有函数签名不同，用 lambda 适配。
+_ACTION_EXECUTORS = {
+    "出选题": _exec_topics,
+    "写脚本": lambda msg, content, task, rounds, replies, params: _write_script(msg, content, task, rounds, replies, params),
+    "审核脚本": lambda msg, content, task, rounds, replies, params: _review_script(msg, content, rounds, replies),
+    "看排期表": _exec_view_schedule,
+    "改排期": _exec_change_schedule,
+    "改表格结构": _exec_table_column,
+    "确认已发布": _exec_mark_published,
+    "确认排期": _exec_confirm_publish,
+    "反馈修改": lambda msg, content, task, rounds, replies, params: _revise(msg, content, rounds, replies),
+    "追问": lambda msg, content, task, rounds, replies, params: _ask(msg, content, rounds, replies),
+    "要审核理由": _exec_review_reasons,
+    "记素材": _exec_record_material,
+    "看完整讨论": _exec_history,
+    "查记录": _exec_lookup_record,
+    "查已用选题": _exec_used_topics,
+    "圆桌讨论": lambda msg, content, task, rounds, replies, params: _roundtable(msg, content, params, rounds, replies),
+    "学规则": lambda msg, content, task, rounds, replies, params: _learn_rules(msg, content, rounds, replies),
+    "确认规则": lambda msg, content, task, rounds, replies, params: _confirm_rules(msg, content, replies),
+    "数据回流": lambda msg, content, task, rounds, replies, params: _reflow(msg, content, replies),
+    "更新市场情报": lambda msg, content, task, rounds, replies, params: _refresh_market(msg, replies),
+    "改审核看法": _exec_revise_review_rules,
+    "专家闲聊": _exec_expert_chat,
+}
+
+def _execute_action(msg: InboundMessage, action: str, task: str, rounds: list, replies: list, params: dict) -> None:
+    fn = _ACTION_EXECUTORS.get(action)
+    if not fn:
+        _log.info("未知动作 %s，跳过执行", action)
+        return
+    _log.info("执行动作 %s", action)
+    try:
+        fn(msg, msg.content, task, rounds, replies, params or {})
+    except Exception as e:
+        _log.error("动作 %s 执行失败: %s", action, e)
+        if not replies:
+            replies.append(OutboundMessage(msg.chat_id, f"{action}执行失败，稍后再试。", "小席"))
+
+def _action_allowed(role: str, action: str) -> bool:
+    if action in _PERMISSION_USER_READONLY:
+        return _is_user(role) or _is_admin(role)
+    if action == "确认已发布":
+        return _is_admin(role) or role == "发片同事"
+    if action in ("确认排期", "专家闲聊"):
+        return True
+    return _is_admin(role)
+
+def _deny_message(role: str, action: str) -> str:
+    if role == "未知":
+        return "无权限：当前身份未识别"
+    return "无权限：只有老板或产品能做这个，用户只读。"
 
 def handle_message(msg: InboundMessage) -> list[OutboundMessage]:
     role = msg.sender_role
@@ -583,41 +822,94 @@ def handle_message(msg: InboundMessage) -> list[OutboundMessage]:
 
     rounds = store.history(msg.chat_id)
     history_text = render_history(rounds)
-    result = _recognize(content, history_text)
-    intent = result.intent
-    _log.info("意图 %s 参数=%s", intent, result.params)
 
-    if _pipelines.get(msg.chat_id, {}).get("step") == "wait_boss" and _is_admin(role):
+    if _pipelines.get(msg.chat_id, {}).get("step") == "wait_boss" and (_is_admin(role) or _is_pipeline_owner(msg)):
         _resolve_doubt(msg, content, rounds, replies)
         return replies
+
+    if _pipelines.get(msg.chat_id, {}).get("step") == "wait_schedule" and (_is_admin(role) or _is_pipeline_owner(msg)):
+        _resolve_schedule(msg, content, replies)
+        return replies
+
+    if _pipelines.get(msg.chat_id, {}).get("step") == "wait_style" and (_is_admin(role) or _is_pipeline_owner(msg)):
+        _resolve_style(msg, content, rounds, replies)
+        return replies
+
+    if msg.chat_id in _used_cursor:
+        if any(w in content for w in _USED_CONTINUE_WORDS):
+            _send_used_page(msg.chat_id, replies, _used_cursor[msg.chat_id])
+            _remember(msg, replies)
+            return replies
+        if any(w in content for w in _USED_STOP_WORDS):
+            _used_cursor.pop(msg.chat_id, None)
+            replies.append(OutboundMessage(msg.chat_id, "好，已用选题看完了，要继续出题随时说。", "小席"))
+            _remember(msg, replies)
+            return replies
 
     if _is_admin(role) and not rules.has_pending() and _is_affirmative(content):
         pending = _pop_pending(msg.chat_id)
         if pending is not None:
-            _log.info("老板确认提议 → 执行待定动作 intent=%s", pending["intent"])
-            _route_intent(msg, IntentResult(pending["intent"], pending.get("params") or {},
-                                            content, pending.get("task") or ""), rounds, replies)
+            action = pending.get("action")
+            _log.info("老板确认提议 → 执行待定动作 action=%s", action)
+            if action:
+                _execute_action(msg, action, pending.get("task") or "", rounds, replies, pending.get("params") or {})
             _remember(msg, replies)
             return replies
 
-    if intent == "确认已发布":
-        if _is_admin(role) or role == "发片同事":
-            ok = _try_mark_published(content)
-            replies.append(OutboundMessage(msg.chat_id, f"已发状态：{ok}", "小席"))
+    step = _pipelines.get(msg.chat_id, {}).get("step", "")
+    plan = _planner(msg, content, history_text, rounds)
+    if plan is None:
+        _chat_reply(msg, content, rounds, replies)
+        _remember(msg, replies)
+        return replies
+    if step:
+        plan.action = ""  # 任何流水线态活跃：规划器只陪聊不派活，防自动改稿循环中途重复派单
+
+    if plan.action:
+        if _action_allowed(role, plan.action):
+            _log.info("动作命中，丢弃规划器自然回复 action=%s", plan.action)
+            _execute_action(msg, plan.action, plan.task, rounds, replies, plan.params)
+            if not replies and plan.reply:
+                replies.append(OutboundMessage(msg.chat_id, plan.reply, "小席"))
         else:
-            replies.append(OutboundMessage(msg.chat_id, "无权限：只有老板、产品或发片同事能确认已发布", "小席"))
+            replies.append(OutboundMessage(msg.chat_id, _deny_message(role, plan.action), "小席"))
         _remember(msg, replies)
         return replies
 
-    if intent in _ADMIN_ONLY and not _is_admin(role):
-        if role == "未知" and intent == "看排期表":
-            replies.append(OutboundMessage(msg.chat_id, "无权限：当前身份未识别", "小席"))
-        else:
-            replies.append(OutboundMessage(msg.chat_id, "无权限：只有老板或产品能派单或改排期", "小席"))
+    # 规划器未写动作 → 兜底链，保高信号指令不静默
+    record_reply = _lookup_topic_record(msg.chat_id, content, rounds, replies)
+    if record_reply:
+        _log.info("查选题记录 → 真核对回执")
+        replies.append(OutboundMessage(msg.chat_id, record_reply, "小席"))
         _remember(msg, replies)
         return replies
-
-    _route_intent(msg, result, rounds, replies)
+    reason_reply = _show_review_reasons(msg.chat_id, content, rounds)
+    if reason_reply:
+        _log.info("老板要审核理由，直发存档详情")
+        replies.append(OutboundMessage(msg.chat_id, reason_reply, "席小核"))
+        _remember(msg, replies)
+        return replies
+    target = next((n for n in msg.mention_names if n in _EXPERT_ROLES), "")
+    if target:
+        _log.info("老板直接 @%s 闲聊，派单该角色自然接话", target)
+        out = _dispatch_expert(msg.chat_id, replies, target,
+                               f"老板在群里直接找你聊：{content}\n"
+                               "先自然共情接住老板的话，别摆架子；然后绕回你的本职工作，主动建议一个具体下一步。",
+                               _recent_context(rounds))
+        if out is not None:
+            _register_expert_proposal(msg.chat_id, out)
+            replies.append(OutboundMessage(msg.chat_id, out, target))
+        _remember(msg, replies)
+        return replies
+    force = _force_script_task(content, rounds)
+    if force:
+        _log.info("规划器未派活但命中产出指令，强制写脚本派单")
+        _write_script(msg, content, force, rounds, replies)
+        _remember(msg, replies)
+        return replies
+    if not replies:
+        reply = plan.reply or _chat_generate(content, render_history(rounds))
+        replies.append(OutboundMessage(msg.chat_id, reply, "小席"))
     _remember(msg, replies)
     return replies
 
@@ -776,12 +1068,15 @@ def _ask(msg: InboundMessage, content: str, rounds: list, replies: list) -> None
     if not prev:
         replies.append(OutboundMessage(msg.chat_id, "没有找到可追问的上一条产出", "小席"))
         return
-    expert_role = speaker if speaker in ("席小题", "席小文") else "席小文"
-    ctx = f"【你上次的产出 · {speaker}】\n{prev}"
     if speaker == "席小题":
         topics, basis = context_store.load_basis(msg.chat_id, "席小题")
         if basis:
-            ctx += f"\n\n【你上次的选题与依据（固定存档，可直接引用）】\n{topics}\n【依据】\n{basis}"
+            _log.info("追问 席小题依据 → 直发存档依据（真实句，不重生成）")
+            replies.append(OutboundMessage(msg.chat_id,
+                                           f"依据如下（席小题出题时写的，第 N 条对应第 N 个选题）：\n{basis}", "席小题"))
+            return
+    expert_role = speaker if speaker in ("席小题", "席小文") else "席小文"
+    ctx = f"【你上次的产出 · {speaker}】\n{prev}"
     _log.info("追问 派单 %s", speaker)
     out = _dispatch_expert(msg.chat_id, replies, expert_role, f"{EXPLAIN_MARK}{content}", ctx)
     if out is not None:
@@ -844,11 +1139,17 @@ def _last_any_output(rounds: list):
 
 
 def _show_review_reasons(chat_id: str, content: str, rounds: list) -> str:
-    # 席小核刚审完（最近一条专家产出），老板回短确认词要理由 → 直发存档详情；详情缺失则现生成简洁理由
-    if not any(w in content for w in _REASON_YES):
-        return ""
+    # 只当席小核刚审完并邀约「需要给您展示理由吗？」、老板短回应要看理由时才直发存档详情。
+    # 此前单个「要」字会误触发，把与消息无关的旧审核存档甩出来（2026-08-07 事故）。
     speaker, prev = _last_any_output(rounds)
     if speaker != "席小核" or not prev:
+        return ""
+    if "需要给您展示理由吗" not in prev:
+        return ""
+    c = content.strip()
+    if len(c) > 8:
+        return ""
+    if not any(w in c for w in _REASON_YES):
         return ""
     return _review_reasons(chat_id, rounds)
 
@@ -885,13 +1186,14 @@ def _learn_rules(msg: InboundMessage, content: str, rounds: list, replies: list)
         replies.append(OutboundMessage(msg.chat_id, out, "席小习"))
 
 def _confirm_rules(msg: InboundMessage, content: str, replies: list) -> None:
-    if not rules.has_pending():
+    su = _last_style.get(msg.chat_id, "老席")
+    if not rules.has_pending(style_user=su):
         replies.append(OutboundMessage(msg.chat_id, "当前没有待确认的规则", "小席"))
         return
     reject = any(w in content for w in ("不用", "算了", "别学", "撤销", "否"))
-    n = rules.confirm_pending(not reject)
+    n = rules.confirm_pending(not reject, style_user=su)
     replies.append(OutboundMessage(msg.chat_id,
-        f"已丢弃 {n} 条待确认规则" if reject else f"已确认 {n} 条规则，写入风格档案，下次产出生效", "小席"))
+        f"已丢弃 {n} 条待确认规则" if reject else f"已确认 {n} 条规则，写入「{su}」风格档案，下次产出生效", "小席"))
 
 _ABORT_WORDS = ("算了", "不用了", "放弃", "先不管", "驳回")
 # 老板在 wait_boss 下回「放行」→ 按当前脚本通过定稿，不落规则、不再派改稿（防把放行话术误当答案，导致越改越复审的死循环）
@@ -903,6 +1205,14 @@ _PASS_EXACT = ("没问题", "OK", "好的", "可以")
 def _is_pass(content: str) -> bool:
     c = content.strip()
     return any(p in c for p in _PASS_HINTS) or c in _PASS_EXACT
+
+def _ask_schedule(chat_id: str, script: str, replies: list) -> None:
+    """定稿出口统一问排期：审核通过或老板放行后，@提出者 等排期信息（排哪天/负责人）。"""
+    _pipelines[chat_id] = {"step": "wait_schedule", "script": script, "ts": time.time()}
+    _post(chat_id, replies, "小席",
+          f"{_requester_mention(chat_id)}写脚本流水线完成：席小文出稿 + 席小核审核通过。\n"
+          "要不要上排期表？排哪天几点？负责人是哪个发片同事？\n"
+          "回「排 8/10 12:00」（负责人不写就默认发片同事），或「先不排」。")
 
 def _resolve_doubt(msg: InboundMessage, content: str, rounds: list, replies: list) -> None:
     # 席小核给疑问点暂停等老板拍板。老板三种选择：
@@ -917,14 +1227,14 @@ def _resolve_doubt(msg: InboundMessage, content: str, rounds: list, replies: lis
         return
     if _is_pass(content):
         _record_passed(msg.chat_id)
-        _post(msg.chat_id, replies, "小席",
-              "收到，疑问不再纠结——当前脚本按通过定稿。要改随时说。")
+        _ask_schedule(msg.chat_id, pipe["script"], replies)
         _remember(msg, replies)
         return
     answer = content.strip()
     _log.info("老板答复审核疑问，落规则 + 让席小文修改")
     try:
-        rules.add_confirmed_rule(f"老板确认审核疑问（{_cap(pipe['reviewer'], 40)}）", answer)
+        rules.add_confirmed_rule(f"老板确认审核疑问（{_cap(pipe['reviewer'], 40)}）", answer,
+                                 style_user=_last_style.get(msg.chat_id, "老席"), rtype="事实规则")
     except Exception as e:
         _log.error("记录疑问答案规则失败: %s", e)
     first = pipe["reviewer"].strip().split(chr(10), 1)[0]
@@ -948,6 +1258,61 @@ def _admin_at_mentions() -> str:
         _log.error("读取 admin open_id 失败: %s", e)
     ids = list(dict.fromkeys(ids))
     return " ".join(f'<at user_id="{oid}"></at>' for oid in ids)
+
+def _requester_mention(chat_id: str) -> str:
+    # 发起写脚本需求的真人 → 针对性 @ 他提问（不泛问群）；没记录到就空串
+    oid = _requester_by_chat.get(chat_id, "")
+    return f'<at user_id="{oid}"></at>' if oid else ""
+
+
+_SCHEDULE_NO_WORDS = ("不排", "先不排", "不用了", "算了", "先不上", "不了", "先不用")
+
+def _resolve_schedule(msg: InboundMessage, content: str, replies: list) -> None:
+    """定稿后等老板/产品给排期信息：解析日期时间负责人 → 记录排期，或取消。"""
+    pipe = _pipelines.pop(msg.chat_id, None)
+    if not pipe:
+        return
+    if any(w in content for w in _SCHEDULE_NO_WORDS):
+        _post(msg.chat_id, replies, "小席", "好，先不排。脚本已定稿，随时说一声就上排期。")
+        return
+    date = _extract_date(content)
+    if not date and any(k in content for k in ("今天", "明天", "下周", "下星期", "星期", "周")):
+        date = _resolve_date(content)
+    if not date:
+        _post(msg.chat_id, replies, "小席",
+              f"{_requester_mention(msg.chat_id)}给我个具体日期时间，比如「排 8/10 12:00」；或回「先不排」。")
+        _pipelines[msg.chat_id] = dict(pipe, ts=time.time())
+        return
+    entry = _build_schedule_entry(pipe.get("script", ""), content, msg.chat_id, date)
+    add_entry(entry)
+    add_used(entry["topic"])
+    _post(msg.chat_id, replies, "小席",
+          f"已排上：{entry['date']} {entry['publish_time']} 发「{entry['topic']}」负责人={entry['owner']}（脚本已入列）"
+          + _base_link())
+
+
+def _build_schedule_entry(script: str, content: str, chat_id: str, date: str) -> dict:
+    topic, ctype = _draft_ctx.get(chat_id, ("", ""))
+    if not topic:
+        topic = _script_title(script) or "脚本"
+    if not ctype:
+        ctype = "曝光"
+    owner = "发片同事"
+    m = re.search(r"(?:负责人|给|归)\s*([^，。；、\s]{1,6})", content)
+    if m and m.group(1) not in ("是", "的", "谁", "发片"):
+        owner = m.group(1)
+    return {"date": date,
+            "publish_time": _resolve_time(content),
+            "content_type": ctype, "topic": topic,
+            "goal": "拉新", "status": "待产", "owner": owner,
+            "script": script or "", "source_chat": chat_id}
+
+
+def _script_title(script: str) -> str:
+    m = _SCRIPT_HEADER_RE.search(script or "")
+    if m and m.group(1).strip():
+        return m.group(1).strip()[:30]
+    return ""
 
 def _reflow(msg: InboundMessage, content: str, replies: list) -> None:
     parsed = _parse_reflow_data(content)
@@ -1046,7 +1411,12 @@ def _fmt(d: datetime.date) -> str:
 
 def _extract_date(text: str) -> str:
     m = re.search(r"(\d{1,2})/(\d{1,2})", text or "")
-    return m.group(0) if m else ""
+    if m:
+        return m.group(0)
+    m = re.search(r"(\d{1,2})月(\d{1,2})日", text or "")
+    if m:
+        return f"{int(m.group(1))}/{int(m.group(2))}"
+    return ""
 
 
 def _resolve_time(text: str) -> str:
@@ -1102,8 +1472,52 @@ def set_base_url(url: str) -> None:
 def _base_link() -> str:
     return f"\n多维表格：{_base_url}" if _base_url else ""
 
+def _schedule_reply() -> str:
+    """看排期表回执：配了多维表格就直接给链接，不刷整张表；未配才回本地表格。"""
+    if _base_url:
+        return f"多维表格：{_base_url}"
+    return "当前排期表：\n" + render_schedule()
+
+_TABLE_COLUMN_ALIASES = {"脚本": "脚本内容", "详细脚本": "脚本内容", "脚本全文": "脚本内容", "脚本正文": "脚本内容"}
+
+def _parse_column_name(content: str) -> str:
+    # 先认已知列名（口语「把详细脚本内容也放到里面」= 脚本内容），再兜底抓「放/存 XX」或「XX列」
+    for kw in ("脚本内容", "脚本全文", "详细脚本", "脚本正文"):
+        if kw in content:
+            return "脚本内容"
+    if "负责人" in content:
+        return "负责人"
+    m = re.search(r"(?:放|存|填|展示|记录)\s*([^，。；、\s]{1,8})", content)
+    if m:
+        return _TABLE_COLUMN_ALIASES.get(m.group(1), m.group(1))
+    m = re.search(r"([^，。；、\s]{1,6})列(?:吧|呢)?", content)
+    return _TABLE_COLUMN_ALIASES.get(m.group(1), m.group(1)) if m else ""
+
+def _add_table_column(content: str) -> str:
+    name = _parse_column_name(content)
+    if not name:
+        return "你要加一列放什么？说清楚列名，比如「单开一列放脚本内容」。"
+    if name == "负责人":
+        return "负责人列已经在了，不用重复加。"
+    try:
+        base_bridge.add_column(name)
+    except Exception as e:
+        _log.error("加列「%s」失败: %s", name, e)
+        return f"加列「{name}」失败：{_cap(str(e))}"
+    if name == "脚本内容":
+        return "已加「脚本内容」列——本地排期表 schema 已同步，定稿的脚本会自动填进这一列。"
+    return f"已加「{name}」列（文本）。只有「脚本内容」列会自动填，其他列需要手动维护。"
+
 def _is_admin(role: str) -> bool:
     return role == "老板" or role == "产品"
+
+def _is_user(role: str) -> bool:
+    return role == "用户"
+
+def _is_pipeline_owner(msg: InboundMessage) -> bool:
+    # 发起该条写脚本流水线的真人：他也算需求方，可回排期/审核确认，不必等老板
+    oid = _requester_by_chat.get(msg.chat_id, "")
+    return bool(oid) and msg.sender_open_id == oid
 
 def _try_mark_published(content: str) -> str:
     parts = content.replace("已发布", "").strip()

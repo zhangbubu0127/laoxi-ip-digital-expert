@@ -9,7 +9,7 @@ _PROFILE = "小席"
 _FIELD_MAP = [
     ("date", "日期"), ("publish_time", "发布时间"), ("content_type", "内容类型"),
     ("topic", "选题"), ("goal", "目标"), ("status", "状态"),
-    ("owner", "负责人"), ("data", "数据回流"),
+    ("owner", "负责人"), ("data", "数据回流"), ("script", "脚本内容"),
 ]
 
 
@@ -79,3 +79,15 @@ def sync_rows(rows: list) -> None:
             args += ["--record-id", rid]
         _run(args)
     _log.info("多维表格同步 %d 行 → %s", len(rows), ref.get("base_url", ""))
+
+
+def add_column(name: str, field_type: str = "text") -> dict:
+    """给排期表多维表格加一列（老板/产品群内指令触发）。列名重复时 lark-cli 报错，由调用方兜底。"""
+    ref = _load_ref()
+    token, table = ref["base_token"], ref["table_id"]
+    out = _run(["lark-cli", "base", "+field-create", "--base-token", token,
+                "--table-id", table,
+                "--json", json.dumps({"name": name, "type": field_type}, ensure_ascii=False),
+                "--profile", _PROFILE])
+    _log.info("多维表格加列「%s」→ %s", name, ref.get("base_url", ""))
+    return out

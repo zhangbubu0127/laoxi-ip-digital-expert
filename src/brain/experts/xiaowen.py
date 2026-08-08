@@ -1,5 +1,5 @@
 from brain.llm import generate as _default_generate
-from brain.knowledge import load_file, load_qna
+from brain.knowledge import load_file, load_qna, load_style
 from brain.reflow import load_conclusions
 from brain.experts.base import Expert
 from brain.rules import render_rules
@@ -7,19 +7,20 @@ from brain.rules import render_rules
 class XiaowenExpert(Expert):
     name = "席小文"
 
-    def __init__(self, generate=_default_generate):
+    def __init__(self, generate=_default_generate, style_user: str = "老席"):
         self._generate = generate
+        self.style_user = style_user or "老席"
 
     def handle(self, task: str, context: str = "") -> str:
         system = self._system(task)
         version = "v2" if ("修改" in task or "反馈" in task) else "v1"
         user = (
             f"基于以上，写一条短视频脚本：{task}。\n"
-            "【硬性要求】任务里给了具体选题（如「写『XX』这条」）或带了选题列表，必须严格写指定的那一条"
-            "（有列表就从列表里选 1 个最合适的来写），禁止自己发明、替换或泛化成别的主题；"
+            "【硬性要求】任务里给了具体选题（如「写『XX』这条」）或带了选题列表，优先写指定的那一条"
+            "（有列表就从列表里选 1 个最合适的来写），别自己发明或替换成别的主题；"
             "只有任务完全没给选题时才自由发挥。\n"
-            "输出必须严格按以下格式，六大模块一个都不能少，禁止省略或重排：\n"
-            f"【席小文】## 脚本 {version}：<一句话标题>\n"
+            "输出参考以下结构（按主题自然组织，允许调整段落，不必死板逐段照抄），但第一行固定为：\n"
+            f"## 脚本 {version}：<一句话标题>\n"
             "\n"
             "【口播正文】\n"
             "<口播正文，一整段，老席第一人称、北方口语、反常识劝退钩子>\n"
@@ -67,7 +68,7 @@ class XiaowenExpert(Expert):
         return self._generate(system, user)
 
     def _system(self, topic: str = "") -> str:
-        persona = load_file("人设/老席创作要求会纪要.md")
+        persona = load_style(self.style_user)
         facts = load_file("业务事实/费用数据.md")
         patterns = load_file("爆款规律/已验证爆款规律.md")
         redlines = load_file("合规红线/合规红线.md")
@@ -83,7 +84,7 @@ class XiaowenExpert(Expert):
             "- 每句话都要有目的，没目的的删掉。\n"
             "\n"
             "【沟通风格与格式】\n"
-            "0. 闲聊/非任务回复不要带【席小文】等自我标注前缀；正式出脚本时按任务要求以「【席小文】## 脚本 vX：标题」开头。\n"
+            "0. 闲聊/非任务回复不要带【席小文】等自我标注前缀；正式出脚本时按任务要求以「## 脚本 vX：标题」开头（不要带【席小文】等前缀）。\n"
             "0b. 收到闲聊/非任务消息：先自然共情接话，再绕回写作工作主动建议下一步，别死板套格式。\n"
             "0c. 建议的下一步若需要执行（老板点头就能做），把动作名用【】括进建议句：例「要不要我【写脚本】把这个角度落成一条60秒？」；动作名限：重新出选题/写脚本/审核脚本。\n"
             "1. 自称「老席」，用老席第一人称（北方口语、反常识劝退钩子）。\n"
@@ -113,11 +114,11 @@ class XiaowenExpert(Expert):
             "【出错与不确定】\n"
             "- 费用/事实拿不准，先标注待核对，绝不编。\n"
             "\n"
-            f"【人设与创作要求】\n{persona}\n"
-            f"【费用数据（唯一事实来源）】\n{facts}\n"
+            f"【人设与创作要求（风格库：{self.style_user}）】\n{persona}\n"
+            f"【费用数据（事实参考，写作时核对）】\n{facts}\n"
             f"【爆款规律】\n{patterns}\n"
             f"【合规红线】\n{redlines}\n"
             f"【家长常问与成单解答（该选题分类的真实成单口径）】\n{load_qna(topic)}\n"
-            f"【已确认规则（老板偏好，必须遵守）】\n{render_rules()}\n"
+            f"【已确认规则（{self.style_user} 风格偏好，必须遵守）】\n{render_rules(style_user=self.style_user)}\n"
             f"【复盘验证结论（学习输入，写作迭代依据）】\n{load_conclusions() or '（暂无）'}\n"
         )
