@@ -22,6 +22,8 @@ _DATA_METRICS = ("播放", "点赞", "互动", "转发", "观看", "浏览")
 _MARKET_HINTS = ("更新情报", "更新市场", "搜竞对", "看竞对", "竞对是谁", "竞对有哪些",
                  "搜热点", "今天什么话题热", "现在什么话题热", "什么热点", "热点是什么",
                  "刷新情报", "刷新市场情报")
+_RESEARCH_HINTS = ("调研", "市场调研", "做调研", "查一下最新", "查查最新", "查一下市场", "查查市场",
+                   "了解下最新", "了解一下最新", "了解下政策", "最新情况", "什么行情", "怎么运作")
 WRITE_SCRIPT_HINTS = ("写条", "写一条", "写个", "出条", "出个", "出内容", "出脚本", "做内容",
                       "做成内容", "按这个出", "根据这个出", "就按这个出", "来一条",
                       "出个60秒", "出条60秒", "出个内容", "文案", "台本", "脚本")
@@ -68,6 +70,9 @@ def by_keyword(content: str) -> IntentResult:
         return IntentResult("记素材", {}, content)
     if any(h in content for h in _MARKET_HINTS):
         return IntentResult("更新市场情报", {}, content)
+    # 调研须在「出选题」判定前，否则「调研下这个选题」会被「选题」误吞
+    if any(h in content for h in _RESEARCH_HINTS):
+        return IntentResult("调研", {}, content)
     if "圆桌" in content or "讨论下" in content or "讨论一下" in content or ("大家" in content and "讨论" in content):
         return IntentResult("圆桌讨论", {}, content)
     if ("完整讨论" in content

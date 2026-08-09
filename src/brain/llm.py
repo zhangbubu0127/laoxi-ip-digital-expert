@@ -54,13 +54,12 @@ def generate(system: str, user: str, max_tokens: int = 8000, temperature: float 
     finish = choice.get("finish_reason")
     _log.info("LLM 调用 model=%s finish=%s usage=%s 耗时=%.1fs",
               secrets["model"], finish, usage, time.monotonic() - start)
-    if content:
-        if finish == "length":
-            raise RuntimeError(f"LLM 输出被截断（finish_reason=length, usage={usage}），需增大 max_tokens")
+    if content and finish != "length":
         return content
-    # 空内容（多为推理模型 thinking 吃满预算只剩推理无正文）：带「直接输出」提示限时重试
-    nudged = user + "\n\n【系统】上一次回答因推理过程占满输出预算、正文为空。请立刻直接输出最终答案正文，不要再展开任何推理。"
-    _log.warning("LLM 空输出（finish=%s usage=%s），带提示重试", finish, usage)
+    # 输出为空或被截断（推理模型 thinking 吃满预算只剩推理 / 回答超 max_tokens）：带「直接输出」提示、加大预算重试，最多 2 次
+    nudged = user + ("\n\n【系统】上一次回答因推理过程占满输出预算或输出长度被截断，正文没给全。"
+                     "请立刻直接输出最终答案正文，不要再展开推理；内容偏长就精简到要点，务必一次给全。")
+    _log.warning("LLM 输出为空或截断（finish=%s usage=%s），带提示重试", finish, usage)
     for attempt in range(2):
         time.sleep(2 * (attempt + 1))
         mt = min(max_tokens + 4000 * (attempt + 1), 16000)
@@ -75,5 +74,5 @@ def generate(system: str, user: str, max_tokens: int = 8000, temperature: float 
             if content:
                 return content
         except Exception as e:
-            _log.warning("LLM 空输出重试异常: %s", e)
-    raise RuntimeError(f"LLM 输出为空（finish={finish}, usage={usage}）")
+            _log.warning("LLM 重试异常: %s", e)
+    raise RuntimeError(f"LLM 输出为空或截断（finish={finish}, usage={usage}）")

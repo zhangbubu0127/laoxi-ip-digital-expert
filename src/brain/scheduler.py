@@ -56,7 +56,7 @@ def add_entry(entry: dict) -> None:
 def mark_published(date: str, topic: str) -> bool:
     rows = load_schedule()
     for r in rows:
-        if r["date"] == date and r["topic"] == topic and r["status"] == "待发":
+        if r["date"] == date and r["topic"] == topic and r["status"] in ("待产", "待发"):
             r["status"] = "已发"
             r["data"] = "待回流"
             _rewrite(rows)

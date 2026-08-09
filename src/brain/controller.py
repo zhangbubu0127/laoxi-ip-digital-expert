@@ -41,6 +41,7 @@ _INTENT_TO_ACTION = {
     "反馈修改": "反馈修改", "追问": "追问", "记素材": "记素材", "看完整讨论": "看完整讨论",
     "查记录": "查记录", "查已用选题": "查已用选题", "圆桌讨论": "圆桌讨论", "学规则": "学规则",
     "确认规则": "确认规则", "数据回流": "数据回流", "更新市场情报": "更新市场情报",
+    "调研": "调研",
 }
 
 def _fallback_planner(msg: InboundMessage, content: str, history_text: str, rounds: list) -> PlanResult | None:
@@ -371,6 +372,9 @@ _pending_action = {}  # chat_id -> {"action", "task", "ts"}：小席提议待老
 _last_style = {}  # chat_id -> 风格用户：最近一次写脚本用的说话风格（多个风格库时小席先问，之后复用）
 _requester_by_chat = {}  # chat_id -> 真人 open_id：发起写脚本流水线的人，定稿/审核疑问时针对性 @ 他，不泛问
 _used_cursor = {}  # chat_id -> 已用选题分页已展示到的下标：查已用选题时按 10 条一页续发
+_pending_reflow = {}  # chat_id -> {"date","topic","data","ts"}：报数据时无「已发」条目先暂存，等确认已发布自动回流
+_last_marked = None  # (date, topic)：最近一次人工确认「已发布」成功的排期行，供回流/连动定位
+_PENDING_REFLOW_TTL = 7200  # 秒；暂存数据只在本窗口内等「已发布」确认，防数据串台到别的视频
 
 def _controller_factories() -> dict:
     return {
@@ -634,6 +638,18 @@ def _exec_topics(msg: InboundMessage, content: str, task: str, rounds: list, rep
     else:
         _pipelines[msg.chat_id] = {"step": "wait_topic", "ts": time.time()}
 
+def _exec_research(msg: InboundMessage, content: str, task: str, rounds: list, replies: list, params: dict | None = None) -> None:
+    # 调研：派席小题用实时搜索调研，任务带【调研】前缀走 research 分支（不走选题 prompt）
+    params = params or {}
+    q = (task or "").strip() or (params.get("topic") or "").strip()
+    if not q:
+        replies.append(OutboundMessage(msg.chat_id, "调研可以。要调研什么？说具体点（比如「调研一下2026新加坡低龄留学政策」）。", "小席"))
+        return
+    _log.info("派单 席小题 调研")
+    out = _dispatch_expert(msg.chat_id, replies, "席小题", f"【调研】{q}")
+    if out is not None:
+        replies.append(OutboundMessage(msg.chat_id, out, "席小题"))
+
 def _exec_view_schedule(msg: InboundMessage, content: str, task: str, rounds: list, replies: list, params: dict | None = None) -> None:
     replies.append(OutboundMessage(msg.chat_id, _schedule_reply(), "小席"))
 
@@ -647,7 +663,8 @@ def _exec_change_schedule(msg: InboundMessage, content: str, task: str, rounds: 
         add_entry(picked)
         add_used(picked["topic"])
         replies.append(OutboundMessage(msg.chat_id,
-            f"已排上：{picked['date']} {picked['publish_time']} 发「{picked['topic']}」（类型：{picked['content_type']}）" + _base_link(), "小席"))
+            f"已排上：{picked['date']} {picked['publish_time']} 发「{picked['topic']}」"
+            f"（类型：{picked['content_type']}，负责人：{picked['owner']}）" + _base_link(), "小席"))
     elif any(w in content for w in _PASSED_HINTS):
         # 老板确认「这条选题/排期发布」但没追溯到刚定稿的选题（如进程重启）→ 明说失败，绝不生成占位
         replies.append(OutboundMessage(msg.chat_id,
@@ -661,9 +678,14 @@ def _exec_change_schedule(msg: InboundMessage, content: str, task: str, rounds: 
                 "你要排哪条选题、排哪天几点？说清楚（如「把第1个排到下周三 12:00」），我马上排。", "小席"))
         else:
             entries = _schedule_entries(params, content)
-            for e in entries:
-                add_entry(e)
-            replies.append(OutboundMessage(msg.chat_id, f"已排{len(entries)}条：" + _base_link(), "小席"))
+            if not entries:
+                # 有排期意图但没数量/选题（如只给「排8/8 18:15 负责人张艺宝」而无刚定稿上下文）→ 明说失败，绝不编占位
+                replies.append(OutboundMessage(msg.chat_id,
+                    "没指定排哪条选题或排几条。说清楚（如「把第1个排到下周三 12:00」或「排3条曝光」），我马上排。", "小席"))
+            else:
+                for e in entries:
+                    add_entry(e)
+                replies.append(OutboundMessage(msg.chat_id, f"已排{len(entries)}条：" + _base_link(), "小席"))
 
 def _exec_table_column(msg: InboundMessage, content: str, task: str, rounds: list, replies: list, params: dict | None = None) -> None:
     _log.info("改表格结构 → 加列")
@@ -692,8 +714,30 @@ def _exec_review_reasons(msg: InboundMessage, content: str, task: str, rounds: l
         replies.append(OutboundMessage(msg.chat_id, reason, "席小核"))
 
 def _exec_mark_published(msg: InboundMessage, content: str, task: str, rounds: list, replies: list, params: dict | None = None) -> None:
-    ok = _try_mark_published(content)
+    params = params or {}
+    ok = _try_mark_published(content, params)
     replies.append(OutboundMessage(msg.chat_id, f"已发状态：{ok}", "小席"))
+    if ok != "确认" or _last_marked is None:
+        return
+    row = next((r for r in load_schedule()
+                if r["date"] == _last_marked[0] and r["topic"] == _last_marked[1]), None)
+    if row is None:
+        return
+    # 连动：同一条消息/参数带数据 → 标完已发直接回流
+    data_str = params.get("data") or _extract_metrics(content)
+    if data_str:
+        data = data_str.replace("万", "w")
+        if record_data(row["date"], row["topic"], data):
+            replies.append(OutboundMessage(msg.chat_id,
+                f"数据已回流：{row['date']}「{row['topic']}」 {data}", "小席"))
+        return
+    # 之前报过数据但没对上已发行 → 暂存数据现在补回流
+    pending = _take_pending(msg.chat_id, row)
+    if pending:
+        data = pending["data"].replace("万", "w")
+        if record_data(row["date"], row["topic"], data):
+            replies.append(OutboundMessage(msg.chat_id,
+                f"数据已回流：{row['date']}「{row['topic']}」 {data}（用之前报的数据）", "小席"))
 
 def _exec_confirm_publish(msg: InboundMessage, content: str, task: str, rounds: list, replies: list, params: dict | None = None) -> None:
     ok = confirm_publish(msg.chat_id)
@@ -774,10 +818,11 @@ _ACTION_EXECUTORS = {
     "圆桌讨论": lambda msg, content, task, rounds, replies, params: _roundtable(msg, content, params, rounds, replies),
     "学规则": lambda msg, content, task, rounds, replies, params: _learn_rules(msg, content, rounds, replies),
     "确认规则": lambda msg, content, task, rounds, replies, params: _confirm_rules(msg, content, replies),
-    "数据回流": lambda msg, content, task, rounds, replies, params: _reflow(msg, content, replies),
+    "数据回流": lambda msg, content, task, rounds, replies, params: _reflow(msg, content, replies, params),
     "更新市场情报": lambda msg, content, task, rounds, replies, params: _refresh_market(msg, replies),
     "改审核看法": _exec_revise_review_rules,
     "专家闲聊": _exec_expert_chat,
+    "调研": _exec_research,
 }
 
 def _execute_action(msg: InboundMessage, action: str, task: str, rounds: list, replies: list, params: dict) -> None:
@@ -856,6 +901,13 @@ def handle_message(msg: InboundMessage) -> list[OutboundMessage]:
             _remember(msg, replies)
             return replies
 
+    if _view_schedule_requested(content):
+        if _action_allowed(role, "看排期表"):
+            _log.info("硬锚命中 看排期表")
+            _exec_view_schedule(msg, content, "", rounds, replies)
+            _remember(msg, replies)
+            return replies
+
     step = _pipelines.get(msg.chat_id, {}).get("step", "")
     plan = _planner(msg, content, history_text, rounds)
     if plan is None:
@@ -867,10 +919,14 @@ def handle_message(msg: InboundMessage) -> list[OutboundMessage]:
 
     if plan.action:
         if _action_allowed(role, plan.action):
-            _log.info("动作命中，丢弃规划器自然回复 action=%s", plan.action)
-            _execute_action(msg, plan.action, plan.task, rounds, replies, plan.params)
-            if not replies and plan.reply:
-                replies.append(OutboundMessage(msg.chat_id, plan.reply, "小席"))
+            if plan.action == "确认已发布" and not _has_publish_confirm(content):
+                _log.info("确认已发布防呆拦截（原文无确认词）")
+                replies.append(OutboundMessage(msg.chat_id, _publish_guard_reply(), "小席"))
+            else:
+                _log.info("动作命中，丢弃规划器自然回复 action=%s", plan.action)
+                _execute_action(msg, plan.action, plan.task, rounds, replies, plan.params)
+                if not replies and plan.reply:
+                    replies.append(OutboundMessage(msg.chat_id, plan.reply, "小席"))
         else:
             replies.append(OutboundMessage(msg.chat_id, _deny_message(role, plan.action), "小席"))
         _remember(msg, replies)
@@ -1090,11 +1146,28 @@ _TOPIC_LOOKUP_PAIRS = (("选题", "看到"), ("选题", "还能看到"), ("选�
                        ("脚本", "还在"), ("脚本", "还能看到"), ("脚本", "哪去了"),
                        ("上次", "还能看到"), ("上次", "还能看见"), ("刚才", "还能看到"), ("刚才", "还能看见"))
 
+def _asks_chosen(content: str) -> bool:
+    # 「我选择出脚本的选题还能看到么」等指向刚选中/刚定稿的那一个，而非整版选题清单
+    if "定稿" in content or "刚定" in content or "刚通过" in content:
+        return True
+    if "出脚本" in content or ("选" in content and "脚本" in content) or "选择" in content:
+        return True
+    return False
+
 def _lookup_topic_record(chat_id: str, content: str, rounds: list, replies: list, force: bool = False) -> str:
     # 老板问「刚才的选题还能看到么」这类：必须真读记录回执，不能闲聊承诺「我去核对」
     # force=True 时跳过关键词对（意图已判定为查记录，或来自小席【行动】立即动作）
     if not force and not any(a in content and b in content for a, b in _TOPIC_LOOKUP_PAIRS):
         return ""
+    # 老板问的是刚选中/刚定稿的那条 → 优先回那一条，不回整版选题 dump
+    lp = _last_passed.get(chat_id) or {}
+    draft = _draft_ctx.get(chat_id) or ("", "")
+    topic = lp.get("topic") or draft[0]
+    if topic and _asks_chosen(content):
+        ctype = lp.get("content_type") or draft[1]
+        _log.info("查选题记录 → 刚选中选题回执")
+        return (f"能看到，你刚选中的选题是「{topic}」（类型：{ctype}）。\n"
+                "要排期 / 写脚本，或按这条继续，直接说就行。")
     topics, _basis = context_store.load_basis(chat_id, "席小题")
     if topics:
         _log.info("查选题记录 → 真核对回执（选题存档）")
@@ -1297,10 +1370,7 @@ def _build_schedule_entry(script: str, content: str, chat_id: str, date: str) ->
         topic = _script_title(script) or "脚本"
     if not ctype:
         ctype = "曝光"
-    owner = "发片同事"
-    m = re.search(r"(?:负责人|给|归)\s*([^，。；、\s]{1,6})", content)
-    if m and m.group(1) not in ("是", "的", "谁", "发片"):
-        owner = m.group(1)
+    owner = _parse_owner(content) or "发片同事"
     return {"date": date,
             "publish_time": _resolve_time(content),
             "content_type": ctype, "topic": topic,
@@ -1314,27 +1384,86 @@ def _script_title(script: str) -> str:
         return m.group(1).strip()[:30]
     return ""
 
-def _reflow(msg: InboundMessage, content: str, replies: list) -> None:
-    parsed = _parse_reflow_data(content)
-    if parsed:
-        date, topic, raw = parsed
-        data = raw.replace("万", "w")
-        if not record_data(date, topic, data):
-            replies.append(OutboundMessage(msg.chat_id, f"没找到「{date} {topic}」的已发条目，确认下日期/选题", "小席"))
-            return
-        conclusion = _dispatch_expert(msg.chat_id, replies, "席小盘", f"日期 {date} 选题 {topic} 数据：{data}", "")
-        if conclusion is None:
-            _pipelines[msg.chat_id] = {"step": "wait_fupan", "date": date, "topic": topic, "data": data, "ts": time.time()}
-            _post(msg.chat_id, replies, "小席", f"数据已回流：{date}「{topic}」 {data}，复盘分析中…")
-            return
-        _post(msg.chat_id, replies, "席小盘", f"数据已回流：{date}「{topic}」 {data}\n\n【席小盘】\n{conclusion}")
-    else:
-        rows = [r for r in load_schedule() if r["status"] == "已发"]
-        if not rows:
-            replies.append(OutboundMessage(msg.chat_id, "当前没有待回流数据（排期表里没有「已发」条目）", "小席"))
+def _reflow(msg: InboundMessage, content: str, replies: list, params: dict | None = None) -> None:
+    params = params or {}
+    date = (params.get("date") or "").strip()
+    topic = (params.get("topic") or "").strip()
+    data_str = (params.get("data") or "").strip()
+    if not data_str:
+        parsed = _parse_reflow_data(content)
+        if parsed:
+            date, topic, data_str = parsed
         else:
-            lines = "\n".join(f"- {r['date']}「{r['topic']}」数据回流：{r['data']}" for r in rows)
-            replies.append(OutboundMessage(msg.chat_id, f"以下条目已发待回流，报数据格式：日期 选题 播放x 留资y\n{lines}", "小席"))
+            # 无 M/D 日期但带数据指标 → 回落到最近一条「已发」行；没有则暂存，等确认已发布自动回流
+            metrics = _extract_metrics(content)
+            if metrics:
+                row = _latest_published_row()
+                if row is None:
+                    _stash_pending(msg.chat_id, "", "", metrics)
+                    replies.append(OutboundMessage(msg.chat_id,
+                        f"数据已记下：{metrics}。等排期表里哪条确认「已发布」，我自动给它回流。", "小席"))
+                    return
+                date, topic, data_str = row["date"], row["topic"], metrics
+            else:
+                rows = [r for r in load_schedule() if r["status"] == "已发"]
+                if not rows:
+                    replies.append(OutboundMessage(msg.chat_id, "当前没有待回流数据（排期表里没有「已发」条目）", "小席"))
+                else:
+                    lines = "\n".join(f"- {r['date']}「{r['topic']}」数据回流：{r['data']}" for r in rows)
+                    replies.append(OutboundMessage(msg.chat_id, f"以下条目已发待回流，报数据格式：日期 选题 播放x 留资y\n{lines}", "小席"))
+                return
+    data = data_str.replace("万", "w")
+    if not record_data(date, topic, data):
+        # 行存在但还没标已发 → 暂存带标题，等这条确认已发布自动回流；行不存在 → 明说没找到
+        if any(r["date"] == date and r["topic"] == topic for r in load_schedule()):
+            _stash_pending(msg.chat_id, date, topic, data)
+            replies.append(OutboundMessage(msg.chat_id,
+                f"数据已记下：{date}「{topic}」 {data}。等这条确认「已发布」后我自动给它回流。", "小席"))
+        else:
+            replies.append(OutboundMessage(msg.chat_id, f"没找到「{date} {topic}」的已发条目，确认下日期/选题", "小席"))
+        return
+    conclusion = _dispatch_expert(msg.chat_id, replies, "席小盘", f"日期 {date} 选题 {topic} 数据：{data}", "")
+    if conclusion is None:
+        _pipelines[msg.chat_id] = {"step": "wait_fupan", "date": date, "topic": topic, "data": data, "ts": time.time()}
+        _post(msg.chat_id, replies, "小席", f"数据已回流：{date}「{topic}」 {data}，复盘分析中…")
+        return
+    _post(msg.chat_id, replies, "席小盘", f"数据已回流：{date}「{topic}」 {data}\n\n【席小盘】\n{conclusion}")
+
+def _stash_pending(chat_id: str, date: str, topic: str, data: str) -> None:
+    _pending_reflow[chat_id] = {"date": date, "topic": topic, "data": data, "ts": time.time()}
+
+def _take_pending(chat_id: str, row: dict):
+    p = _pending_reflow.get(chat_id)
+    if not p:
+        return None
+    if time.time() - p["ts"] > _PENDING_REFLOW_TTL:
+        _pending_reflow.pop(chat_id, None)
+        return None
+    hint = (p.get("topic") or "").strip()
+    d = (p.get("date") or "").strip()
+    # 带标题/日期的暂存只在匹配刚标已发的行时应用，防止串台
+    if hint and not _fuzzy_topic_match(_normalize_topic(hint), _normalize_topic(row["topic"])):
+        return None
+    if d and d != row["date"]:
+        return None
+    _pending_reflow.pop(chat_id, None)
+    return p
+
+def _extract_metrics(content: str) -> str:
+    pairs = re.findall(r"(浏览|播放|点赞|评论|收藏|转发|分享|留资)\s*[:：]?\s*([0-9][0-9\.万w]*)", content)
+    return " ".join(f"{k}{v}" for k, v in pairs)
+
+def _latest_published_row():
+    rows = [r for r in load_schedule() if r["status"] == "已发"]
+    if not rows:
+        return None
+    def key(r):
+        try:
+            m, d = r["date"].split("/")
+            return int(m) * 100 + int(d)
+        except (ValueError, AttributeError):
+            return 0
+    return max(rows, key=key)
 
 def _refresh_market(msg: InboundMessage, replies: list) -> None:
     _log.info("更新市场情报")
@@ -1363,14 +1492,22 @@ def _topic_task(params: dict) -> str:
     topic = (params.get("topic") or params.get("content_type") or "").strip()
     return f"出{count}个没拍过的选题" + (f"，角度：{topic}" if topic else "")
 
+def _parse_count(text: str) -> int:
+    m = re.search(r"([一二两三四五六七八九十\d]+)\s*(条|个)", text or "")
+    return _to_int(m.group(1)) if m else 0
+
 def _schedule_entries(params: dict, content: str = "") -> list[dict]:
-    count = int((params.get("count") or "3").strip("个")) or 3
+    # 只服务批量排期：明确数量（内容或 params.count）才编行；单条排期不在此兜底，杜绝「曝光选题N」占位垃圾
+    count = _parse_count(content) or int((params.get("count") or "0").strip("个"))
+    if count <= 0:
+        return []
     ctype = params.get("content_type") or "曝光"
     date = _resolve_date(params.get("date") or _extract_date(content) or "下周")
     publish_time = _resolve_time((params.get("publish_time") or _extract_time(content) or "").strip())
+    owner = _parse_owner(content) or "发片同事"
     return [
         {"date": date, "publish_time": publish_time, "content_type": ctype, "topic": f"{ctype}选题{i+1}",
-         "goal": "拉新", "status": "待产", "owner": "席小文", "data": "—"}
+         "goal": "拉新", "status": "待产", "owner": owner, "data": "—"}
         for i in range(count)
     ]
 
@@ -1434,15 +1571,45 @@ def _extract_time(text: str) -> str:
 _PICK_HINTS = ("排上", "排一下", "排期", "定了", "选这个", "第")
 _PASSED_HINTS = ("通过了", "排期发布", "发布", "上传", "这条", "这个")
 
+def _parse_owner(content: str) -> str:
+    # 从「负责人张艺宝/给张艺宝/归张艺宝」抽出负责人，无则空串
+    m = re.search(r"(?:负责人|给|归)\s*([^，。；、\s]{1,6})", content or "")
+    if m and m.group(1) not in ("是", "的", "谁", "发片"):
+        return m.group(1)
+    return ""
+
+def _list_reference(content: str) -> bool:
+    # 「第N个/第N条」指列表下标（排上第1个），不能误用刚定稿选题
+    return bool(re.search(r"第[一二两三四五六七八九十\d]+[条个]", content or ""))
+
+def _explicit_count(content: str) -> bool:
+    # 批量排期「排3条/排两个」带数量，不套刚定稿选题
+    return bool(re.search(r"[一二两三四五六七八九十\d]+\s*(条|个)", content or ""))
+
+def _has_schedule_intent(content: str, params: dict) -> bool:
+    # 明确排期意图：日期/时间/负责人/排字已给出，或 params 已解析出日期 → 视为排刚定稿选题
+    if any(params.get(k) for k in ("date", "publish_time")):
+        return True
+    if _extract_date(content) or _extract_time(content):
+        return True
+    if any(k in content for k in ("今天", "明天", "下周", "下星期", "星期", "周")):
+        return True
+    if "负责人" in content or "上排期" in content or re.search(r"排[上入表期发布]", content):
+        return True
+    return False
+
 def _try_pick_topic(content: str, params: dict, rounds: list, chat_id: str = "") -> dict | None:
-    # ① 老板确认刚定稿的脚本选题（「这条选题通过了/排期发布/上传」）→ 用刚定稿的选题+类型
-    if chat_id and chat_id in _last_passed and any(w in content for w in _PASSED_HINTS):
+    # ① 老板确认/排刚定稿的脚本选题（「这条选题通过了/排期发布/排8/8 18:15 负责人张艺宝」）→ 用刚定稿的选题+类型
+    if chat_id and chat_id in _last_passed:
         lp = _last_passed[chat_id]
         if lp.get("topic"):
-            return {"date": _resolve_date(params.get("date") or _extract_date(content) or "下周"),
-                    "publish_time": _resolve_time((params.get("publish_time") or _extract_time(content) or "").strip()),
-                    "content_type": lp["content_type"], "topic": lp["topic"], "goal": "拉新",
-                    "status": "待产", "owner": "席小文", "data": "—"}
+            picked_ready = (any(w in content for w in _PASSED_HINTS)
+                            or _has_schedule_intent(content, params))
+            if picked_ready and not _list_reference(content) and not _explicit_count(content):
+                return {"date": _resolve_date(params.get("date") or _extract_date(content) or "下周"),
+                        "publish_time": _resolve_time((params.get("publish_time") or _extract_time(content) or "").strip()),
+                        "content_type": lp["content_type"], "topic": lp["topic"], "goal": "拉新",
+                        "status": "待产", "owner": _parse_owner(content) or "发片同事", "data": "—"}
     if not any(w in content for w in _PICK_HINTS):
         return None
     speaker, prev = _last_expert_output(rounds)
@@ -1477,6 +1644,32 @@ def _schedule_reply() -> str:
     if _base_url:
         return f"多维表格：{_base_url}"
     return "当前排期表：\n" + render_schedule()
+
+# 看排期表硬锚：明确含「看/查/打开+表格词」或「表格词+链接」→ 不依赖 LLM 直接给排期表
+_VIEW_SCHEDULE_RE = re.compile(
+    r"(?:看|查|打开|看看|看下|看一下|发我|给我|给我发|发一下|贴|给个)\s*(?:下\s*)?"
+    r"(?:排期表|多维表格|表格)"
+    r"|(?:排期表|多维表格|表格)\s*(?:链接|发我|给我|看看|看下)"
+    r"|(?:看|看看|看下)\s*排期"
+)
+# 硬锚排除词：含这些 → 是改表格结构/标已发等，不是看排期表
+_VIEW_SCHEDULE_EXCLUDE = ("改", "结构", "加一列", "删", "标已发", "已发布", "标成")
+
+def _view_schedule_requested(content: str) -> bool:
+    if any(k in (content or "") for k in _VIEW_SCHEDULE_EXCLUDE):
+        return False
+    return bool(_VIEW_SCHEDULE_RE.search(content or ""))
+
+# 确认已发布防呆：高后果动作，原文必须带发布确认信号词才放行（覆盖「刚发布了一条」「已确认发布」等轻确认）
+_PUBLISH_CONFIRM_WORDS = ("已发布", "已发", "已确认发布", "发布了一条", "发布了", "刚发布", "刚发了",
+                          "发了一条", "发过了", "发好了", "发完了", "发布完成", "发出去了", "这条发了", "发了")
+
+def _has_publish_confirm(content: str) -> bool:
+    return any(w in (content or "") for w in _PUBLISH_CONFIRM_WORDS)
+
+def _publish_guard_reply() -> str:
+    link = _base_link()
+    return f"你是要标哪条已发布？说日期+标题，比如「8/8 19岁本科毕业… 已发布」。{link}".strip()
 
 _TABLE_COLUMN_ALIASES = {"脚本": "脚本内容", "详细脚本": "脚本内容", "脚本全文": "脚本内容", "脚本正文": "脚本内容"}
 
@@ -1519,10 +1712,71 @@ def _is_pipeline_owner(msg: InboundMessage) -> bool:
     oid = _requester_by_chat.get(msg.chat_id, "")
     return bool(oid) and msg.sender_open_id == oid
 
-def _try_mark_published(content: str) -> str:
-    parts = content.replace("已发布", "").strip()
-    m = re.match(r"(\d{1,2}/\d{1,2})\s*(.*)", parts)
+def _publish_reply(row: dict, date_mismatch: bool, reported_date: str) -> str:
+    """标已发成功回执；日期不符（用户报的日期与表里不一致但 topic 唯一命中）时提示已按表里日期确认。"""
+    if date_mismatch:
+        return f"确认（注：你报的日期 {reported_date} 表里是 {row['date']}，已按表里 {row['date']} 确认）"
+    return "确认"
+
+def _try_mark_published(content: str, params: dict | None = None) -> str:
+    global _last_marked
+    params = params or {}
+    _last_marked = None
+    if params.get("date") and params.get("topic"):
+        row, date_mm = _resolve_publish_row(params["date"], params["topic"])
+        if row and mark_published(row["date"], row["topic"]):
+            _last_marked = (row["date"], row["topic"])
+            return _publish_reply(row, date_mm, params["date"])
+        return "未找到对应待发条目"
+    body = content.replace("已发布", "").strip()
+    m = re.match(r"(\d{1,2}/\d{1,2})\s*(.*)", body)
     if m and m.group(2).strip():
-        date, topic = m.group(1), m.group(2).strip()
-        return "确认" if mark_published(date, topic) else "未找到对应待发条目"
-    return "格式不对，示例：8/3 普娃逆袭 已发布"
+        row, date_mm = _resolve_publish_row(m.group(1), m.group(2).strip())
+        if row and mark_published(row["date"], row["topic"]):
+            _last_marked = (row["date"], row["topic"])
+            return _publish_reply(row, date_mm, m.group(1))
+        return "未找到对应待发条目"
+    # 无日期 → 剥《》标点后按标题模糊匹配待发行
+    norm = _normalize_topic(body)
+    if norm:
+        for r in load_schedule():
+            if r["status"] in ("待产", "待发") and _fuzzy_topic_match(norm, _normalize_topic(r["topic"])):
+                if mark_published(r["date"], r["topic"]):
+                    _last_marked = (r["date"], r["topic"])
+                    return "确认"
+                return "未找到对应待发条目"
+    return "没找到匹配的待发条目，说清日期+标题（如「8/3 普娃逆袭 已发布」）"
+
+def _resolve_publish_row(date_hint: str, topic_hint: str) -> tuple[dict | None, bool]:
+    """把 LLM/正则给的 date/topic 提示落到一条 待产/待发 行，返回 (row, 日期是否不符)。
+    date_hint 可能是「8/7 19:45」（剥出 M/D 去掉时间），topic_hint 剥《》标点后模糊匹配；
+    日期对得上优先；对不上但标题在待发行里唯一命中时容忍日期笔误（第二元素 True）；
+    找不到或撞题歧义返回 (None, False)。"""
+    dm = re.search(r"(\d{1,2})/(\d{1,2})", date_hint or "")
+    date = f"{int(dm.group(1))}/{int(dm.group(2))}" if dm else ""
+    norm = _normalize_topic(topic_hint or "")
+    if not norm:
+        return None, False
+    exact, fallback = [], []
+    for r in load_schedule():
+        if r["status"] not in ("待产", "待发"):
+            continue
+        if not _fuzzy_topic_match(norm, _normalize_topic(r["topic"])):
+            continue
+        if not date or r["date"] == date:
+            exact.append(r)
+        else:
+            fallback.append(r)
+    if len(exact) == 1:
+        return exact[0], False
+    if len(fallback) == 1:
+        return fallback[0], True
+    return None, False
+
+def _normalize_topic(s: str) -> str:
+    return re.sub(r"[《》「」『』【】\s,，。、？！?!:：;；\"'']+", "", s or "")
+
+def _fuzzy_topic_match(a: str, b: str) -> bool:
+    if not a or not b:
+        return False
+    return a in b or b in a

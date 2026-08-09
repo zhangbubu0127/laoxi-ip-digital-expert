@@ -255,6 +255,27 @@ class TestExperts(unittest.TestCase):
         system = fg.calls[0][0]
         self.assertIn("已确认规则", system)
 
+    def test_xiaoti_prompt_has_competition_positioning(self):
+        fg = FakeGen()
+        XiaotiExpert(generate=fg).handle("帮我出3个选题")
+        system = fg.calls[0][0]
+        self.assertIn("项目竞争口径", system)
+        self.assertIn("不得互相比较优劣势", system)
+
+    def test_xiaowen_prompt_has_competition_positioning(self):
+        fg = FakeGen()
+        XiaowenExpert(generate=fg).handle("普娃预算不够")
+        system = fg.calls[0][0]
+        self.assertIn("项目竞争口径", system)
+        self.assertIn("不得互相比较优劣势", system)
+
+    def test_xiaone_prompt_has_competition_positioning(self):
+        fg = FakeGen()
+        XiaoneExpert(generate=fg).handle("新加坡留学，老席帮你算笔账")
+        system = fg.calls[0][0]
+        self.assertIn("项目竞争口径", system)
+        self.assertIn("不得互相比较优劣势", system)
+
     def test_xiaowen_prompt_shows_no_conclusions_when_file_absent(self):
         from brain import reflow as reflow_mod
         old = reflow_mod._CONCLUSION_PATH

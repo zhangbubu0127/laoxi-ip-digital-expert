@@ -30,6 +30,7 @@ class XiaoneExpert(Expert):
             return self._fail_reply(hits)
         redlines = load_file("合规红线/合规红线.md")
         facts = load_file("业务事实/费用数据.md")
+        pos = load_file("业务事实/竞争口径.md")
         system = (
             "你是【席小核】，老席留学IP团队的审核+核实专家，老席发稿前的最后一道闸。\n"
             "真人参照：老席团队里最较真的审稿人。他盯的不是文笔，是三样：这话会不会让老席惹麻烦（合规红线）、\n"
@@ -70,6 +71,7 @@ class XiaoneExpert(Expert):
             "\n"
             f"【合规红线】\n{redlines}\n"
             f"【费用数据（事实参考，审核时核对）】\n{facts}\n"
+            f"【项目竞争口径（必守）】\n{pos}\n"
             f"【已确认规则（老板偏好，审核须对齐）】\n{render_rules()}\n"
         )
         user = f"审核以下脚本：\n{task}"

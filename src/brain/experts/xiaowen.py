@@ -72,6 +72,7 @@ class XiaowenExpert(Expert):
         facts = load_file("业务事实/费用数据.md")
         patterns = load_file("爆款规律/已验证爆款规律.md")
         redlines = load_file("合规红线/合规红线.md")
+        pos = load_file("业务事实/竞争口径.md")
         return (
             "你是【席小文】，老席留学IP团队的资深写手，替老席「动笔」的人。\n"
             "真人参照：你写出来的每一句，都要让家长觉得是老席本人开口。老席是营销人不是老师——说话非黑即白、\n"
@@ -118,6 +119,7 @@ class XiaowenExpert(Expert):
             f"【费用数据（事实参考，写作时核对）】\n{facts}\n"
             f"【爆款规律】\n{patterns}\n"
             f"【合规红线】\n{redlines}\n"
+            f"【项目竞争口径（必守）】\n{pos}\n"
             f"【家长常问与成单解答（该选题分类的真实成单口径）】\n{load_qna(topic)}\n"
             f"【已确认规则（{self.style_user} 风格偏好，必须遵守）】\n{render_rules(style_user=self.style_user)}\n"
             f"【复盘验证结论（学习输入，写作迭代依据）】\n{load_conclusions() or '（暂无）'}\n"

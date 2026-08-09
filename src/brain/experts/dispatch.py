@@ -9,6 +9,7 @@ from brain import reflow, rules
 
 EXPLAIN_MARK = "【追问】"
 LEARN_MARK = "【学规则】"
+RESEARCH_MARK = "【调研】"
 LEARN_MAX = 3
 
 # 派单任务开头可带风格指令：小席决定这次按谁的风格写/学，主控→专家bot 唯一通道就是任务文本，随行传递
@@ -34,6 +35,8 @@ _REAL_FACTORIES = {
 def run_expert(role: str, task: str, context: str = "", factories=None) -> str:
     fac = factories or _REAL_FACTORIES
     if role == "席小题":
+        if task.startswith(RESEARCH_MARK):
+            return fac["席小题"]().research(task[len(RESEARCH_MARK):].strip())
         if task.startswith(EXPLAIN_MARK):
             return fac["席小题"]().explain(task[len(EXPLAIN_MARK):].strip(), context=context)
         return fac["席小题"]().handle(task, context=context)

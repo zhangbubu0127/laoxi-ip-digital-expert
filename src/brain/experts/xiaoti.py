@@ -1,5 +1,6 @@
 import re
 from brain.llm import generate as _default_generate
+from brain import research as _research
 from brain.knowledge import load_file
 from brain.material import recent_materials
 from brain.market import intel as market_intel
@@ -37,11 +38,16 @@ class XiaotiExpert(Expert):
         )
         return self._generate(system, user)
 
+    def research(self, question: str) -> str:
+        # 调研走独立流程：Bing 实时搜索 + LLM 成文，不吃选题 prompt（选题素材会干扰调研）
+        return _research.research(question, generate=self._generate)
+
     def _system(self) -> str:
         patterns = load_file("爆款规律/已验证爆款规律.md")
         parents = load_file("家长画像/家长原话库.md")
         persona = load_file("人设/老席创作要求会纪要.md")
         qna = load_file("家长常问与成单解答/典型问题清单.md")
+        pos = load_file("业务事实/竞争口径.md")
         return (
             "你是【席小题】，老席留学IP团队的选题+调研专家，老席的「选题大脑」。\n"
             "真人参照：老席团队里那个专门盯爆款选题的编导。他不靠灵感，靠规律——每天翻家长在评论区、直播间的真问题，\n"
@@ -85,6 +91,7 @@ class XiaotiExpert(Expert):
             f"【家长原话/痛点】\n{parents}\n"
             f"【家长典型问题清单（选题原料）】\n{qna}\n"
             f"【人设与创作要求】\n{persona}\n"
+            f"【项目竞争口径（必守）】\n{pos}\n"
             f"【素材库（用户投喂的泛类内容，选题原料）】\n{recent_materials()}\n"
             f"【竞对情报/市场热点（选题原料）】\n{market_intel()}\n"
             f"【已确认规则（老板偏好，出题须遵守）】\n{render_rules()}\n"

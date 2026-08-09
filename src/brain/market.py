@@ -6,6 +6,7 @@ import xml.etree.ElementTree as ET
 import requests
 
 from log import get_logger
+from brain.llm import load_secrets
 
 _log = get_logger("market")
 
@@ -33,18 +34,60 @@ _HOT_QUERIES = ["新加坡留学 2026 热点", "新加坡 低龄留学 政策 20
 _LEAD_QUERIES = ["新加坡留学 中介 机构", "新加坡留学中介 避坑"]
 
 
-def search_web(query: str, top: int = 5) -> list[dict]:
-    """尽力而为的实时搜索：Bing RSS，无 key。风控/超时/无关结果一律回落 []。"""
+def search_web(query: str, top: int = 5, sg_filter: bool = True) -> list[dict]:
+    """尽力而为的实时搜索：优先 Tavily（配了 key 时），否则回落 Bing RSS。
+    风控/超时/无关结果一律回落 []。
+    sg_filter=False 时跳过新加坡关键词过滤（调研非新加坡限定主题时用，如中本贯通）。"""
+    items = _tavily_search(query, top) or _bing_rss(query, top)
+    return [i for i in items if not sg_filter or _sg_relevant(i)]
+
+
+def _tavily_search(query: str, top: int) -> list[dict]:
+    key = _tavily_key()
+    if not key:
+        return []
+    try:
+        r = requests.post("https://api.tavily.com/search",
+                          headers={"Authorization": f"Bearer {key}",
+                                   "Content-Type": "application/json"},
+                          json={"query": query, "max_results": max(top, 5),
+                                "search_depth": "basic"},
+                          timeout=_TIMEOUT)
+        if r.status_code != 200:
+            _log.warning("Tavily 搜索失败 status=%s", r.status_code)
+            return []
+        data = r.json()
+        out = []
+        for it in data.get("results", []):
+            title = (it.get("title") or "").strip()
+            url = (it.get("url") or "").strip()
+            if not title or not url:
+                continue
+            out.append({"title": title[:120], "url": url,
+                        "snippet": (it.get("content") or "")[:180]})
+        return out[:top]
+    except Exception as e:
+        _log.warning("Tavily 搜索异常 %r: %s", query[:30], e)
+        return []
+
+
+def _tavily_key() -> str:
+    try:
+        return load_secrets().get("tavily_api_key") or ""
+    except Exception:
+        return ""
+
+
+def _bing_rss(query: str, top: int) -> list[dict]:
     try:
         r = requests.get("https://www.bing.com/search",
                          params={"format": "rss", "count": str(max(top, 5)), "q": query},
                          headers=_HEADERS, timeout=_TIMEOUT)
         if r.status_code != 200:
             return []
-        items = _parse_rss(r.text, top)
-        return [i for i in items if _sg_relevant(i)]
+        return _parse_rss(r.text, top)
     except Exception as e:
-        _log.warning("市场搜索失败 %r: %s", query[:30], e)
+        _log.warning("Bing RSS 搜索失败 %r: %s", query[:30], e)
         return []
 
 

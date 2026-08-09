@@ -97,8 +97,16 @@ class TestPlanCall(unittest.TestCase):
         for a in ("出选题", "写脚本", "审核脚本", "看排期表", "改排期", "改表格结构",
                   "确认已发布", "确认排期", "反馈修改", "追问", "要审核理由", "记素材",
                   "看完整讨论", "查记录", "查已用选题", "圆桌讨论", "学规则", "确认规则",
-                  "数据回流", "更新市场情报", "改审核看法", "专家闲聊"):
+                  "数据回流", "更新市场情报", "改审核看法", "专家闲聊", "调研"):
             self.assertIn(a, ACTIONS)
+
+    def test_planner_prompt_clarifies_research_semantics(self):
+        # 调研是白名单动作，提示词须给出触发语义，避免老板「帮我查查X」被当闲聊
+        fg = FakeGen("收到。")
+        plan("随便聊聊", generate=fg)
+        system = fg.calls[0][0]
+        self.assertIn("调研", system)
+        self.assertIn("派席小题用实时搜索调研", system)
 
 if __name__ == "__main__":
     unittest.main()

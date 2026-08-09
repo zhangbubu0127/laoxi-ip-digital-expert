@@ -23,6 +23,10 @@ class FakeExpert:
         self.last_explain_context = context
         return self.text
 
+    def research(self, question):
+        self.last_task = question
+        return "【调研】" + self.text
+
 def msg(content, role="老板", mid="m1", mention_names=None, sender_open_id="ou_x"):
     return InboundMessage(message_id=mid, chat_id="oc_t", content=content,
                           sender_open_id=sender_open_id, sender_role=role, mentions=[],
@@ -57,6 +61,8 @@ def _fake_planner(msg, content, history_text="", rounds=None):
         return PlanResult("", "审核脚本", content)
     if "已用选题" in content or "用过的选题" in content or "历史选题" in content or "用过哪些" in content:
         return PlanResult("", "查已用选题", content)
+    if "调研" in content or "查一下" in content or "了解下" in content or "查查" in content:
+        return PlanResult("", "调研", content)
     if "选题" in content or "角度" in content:
         return PlanResult("", "出选题", "", {"count": "3"})
     if "脚本" in content:
@@ -104,6 +110,8 @@ class TestController(unittest.TestCase):
         controller._pipelines.clear()
         controller._requester_by_chat.clear()
         controller._used_cursor.clear()
+        controller._pending_reflow.clear()
+        controller._last_marked = None
         controller._pull_history = lambda chat_id, n: "【同事】群里讨论了预算对比方案"
         controller._chat_generate = lambda content, history_text="": "需要我做什么？出选题/写脚本/看排期/讨论？"
         controller._context_put = lambda chat_id, role, task, context: "testtoken"
@@ -162,6 +170,23 @@ class TestController(unittest.TestCase):
         self.assertTrue(any("席小题" in t for _, _, t in emitted))
         # 异步派单不立即发提醒，等席小题产出回来再补
         self.assertFalse(any("已用选题" in m.text for m in out))
+
+    def test_research_dispatches_xiaoti_with_mark(self):
+        emitted = []
+        controller._emit = lambda chat_id, text, tag: emitted.append((chat_id, text, tag))
+        def fake_by_role(role):
+            return {"profile": role, "open_id": f"ou_{role}"}
+        with mock.patch.object(controller.bots, "by_role", fake_by_role):
+            out = handle_message(msg("调研一下中本贯通是什么"))
+        # 调研不设流水线：席小题直接回群；派单任务带【调研】前缀走调研分支
+        self.assertFalse(controller._pipelines.get("oc_t"))
+        self.assertTrue(any(tag == "席小题" and "【调研】调研一下中本贯通是什么" in t
+                            for _, t, tag in emitted))
+
+    def test_research_single_bot_fallback_calls_research(self):
+        out = handle_message(msg("调研一下中本贯通是什么"))
+        self.assertTrue(any(m.agent_tag == "席小题" and "【调研】" in m.text for m in out))
+        self.assertEqual(self.xiaoti.last_task, "调研一下中本贯通是什么")
 
     def test_out_topic_wait_topic_hint_on_xiaoti_output(self):
         emitted = []
@@ -353,6 +378,29 @@ class TestController(unittest.TestCase):
         # 无刚定稿上下文、也无序号 → 返回 None（不生成占位，由上层给老板明说失败）
         self.assertIsNone(controller._try_pick_topic("这条选题通过了，把类型和选题都上传", {}, [], "oc_t"))
 
+    def test_schedule_uses_last_passed_with_date_owner(self):
+        # 排期流水线超时后补排「排8/8 18:15 负责人张艺宝」→ 落到刚定稿选题+类型+负责人，不生成占位行
+        controller._last_passed["oc_t"] = {"topic": "19岁本科毕业，在新加坡能找到什么工作？真实工资单给你看",
+                                           "content_type": "留资"}
+        picked = controller._try_pick_topic("排8/8 18:15 负责人张艺宝", {}, [], "oc_t")
+        self.assertIsNotNone(picked)
+        self.assertEqual(picked["topic"], "19岁本科毕业，在新加坡能找到什么工作？真实工资单给你看")
+        self.assertEqual(picked["content_type"], "留资")
+        self.assertEqual(picked["date"], "8/8")
+        self.assertEqual(picked["publish_time"], "18:15")
+        self.assertEqual(picked["owner"], "张艺宝")
+        self.assertNotIn("曝光选题", picked["topic"])
+
+    def test_schedule_bulk_count_ignores_last_passed(self):
+        # 批量排期「排3条曝光下周三」→ 不误用刚定稿选题，返回 None 走批量编行
+        controller._last_passed["oc_t"] = {"topic": "刚定稿的选题", "content_type": "留资"}
+        self.assertIsNone(controller._try_pick_topic("排3条曝光下周三", {}, [], "oc_t"))
+
+    def test_schedule_list_index_ignores_last_passed(self):
+        # 「排上第1个」指列表下标 → 不误用刚定稿选题，返回 None 走②列表挑选
+        controller._last_passed["oc_t"] = {"topic": "刚定稿的选题", "content_type": "留资"}
+        self.assertIsNone(controller._try_pick_topic("排上第1个", {}, [], "oc_t"))
+
     def test_lookup_topic_record_from_basis(self):
         # 老板问「刚才的选题还能看到么」→ 真读选题存档回执真实选题，不闲聊承诺
         replies = []
@@ -362,6 +410,19 @@ class TestController(unittest.TestCase):
         self.assertIn("预算对比", out)
         self.assertIn("【曝光】", out)
         self.assertIn("选题存档", out)
+        self.assertEqual(replies, [])
+
+    def test_lookup_prefers_last_passed_chosen(self):
+        # 老板问「我选择出脚本的选题你还能看到么」→ 回刚选中那一条，不回整版选题 dump
+        controller._last_passed["oc_t"] = {"topic": "19岁本科毕业，在新加坡能找到什么工作？真实工资单给你看",
+                                           "content_type": "留资"}
+        replies = []
+        with mock.patch.object(controller.context_store, "load_basis",
+                               return_value=("1.【曝光】预算对比\n2.【信任】费用拆分", "依据")):
+            out = controller._lookup_topic_record("oc_t", "我选择出脚本的选题你还能看到么", [], replies)
+        self.assertIn("19岁本科毕业", out)
+        self.assertNotIn("预算对比", out)
+        self.assertNotIn("选题存档", out)
         self.assertEqual(replies, [])
 
     def test_lookup_topic_record_from_memory(self):
@@ -672,6 +733,174 @@ class TestController(unittest.TestCase):
     def test_reflow_not_found(self):
         out = handle_message(msg("9/9不存在 播放2.1w"))
         self.assertTrue(any("没找到" in m.text for m in out))
+
+    def test_reflow_natural_data_no_date(self):
+        # 自然语言报数据（无 M/D 日期）→ 回落到最近一条「已发」排期行回流，不报「没有待回流数据」
+        handle_message(msg("8/3普娃逆袭已发布"))
+        out = handle_message(msg("昨天发布的视频今日浏览3450，点赞87，评论3，收藏2，转发3，为我录入；并且复盘"))
+        text = "".join(m.text for m in out)
+        self.assertIn("数据已回流", text)
+        self.assertIn("3450", text)
+        row = scheduler.load_schedule()[0]
+        self.assertEqual(row["status"], "回流完成")
+        self.assertIn("3450", row["data"])
+
+    def test_reflow_uses_planner_params(self):
+        # planner 给结构化 date/topic/data → 执行器直接用，不走自然语言解析
+        handle_message(msg("8/3普娃逆袭已发布"))
+        controller._planner = lambda msg, content, history, rounds: PlanResult(
+            "", "数据回流", "", {"date": "8/3", "topic": "普娃逆袭", "data": "播放2.1w 留资23"})
+        out = handle_message(msg("报一下数据"))
+        self.assertIn("数据已回流", "".join(m.text for m in out))
+        row = scheduler.load_schedule()[0]
+        self.assertEqual(row["status"], "回流完成")
+        self.assertEqual(row["data"], "播放2.1w 留资23")
+
+    def test_mark_published_natural_title_no_date(self):
+        # 老板自然语言说《标题》已发布（无 M/D 日期）→ 剥《》按标题模糊匹配排期行，不报「格式不对」
+        scheduler.add_entry({"date": "8/7", "publish_time": "19:17", "content_type": "信任",
+                             "topic": "新加坡私校集体收紧，初中直通本科这条路要断了吗？",
+                             "goal": "留资", "status": "待发", "owner": "发片同事", "data": "—",
+                             "script": "", "source_chat": "oc_t"})
+        handle_message(msg("《新加坡私校集体收紧，初中直通本科这条路要断了吗？》已发布，更新，并且记录刚刚的数据"))
+        rows = scheduler.load_schedule()
+        target = next(r for r in rows if "新加坡私校" in r["topic"])
+        self.assertEqual(target["status"], "已发")
+
+    def test_mark_published_uses_planner_params(self):
+        # planner 给结构化 date/topic → 标已发直接用，不依赖 content 格式
+        controller._planner = lambda msg, content, history, rounds: PlanResult(
+            "", "确认已发布", "", {"date": "8/3", "topic": "普娃逆袭"})
+        out = handle_message(msg("刚发布了一条"))
+        row = scheduler.load_schedule()[0]
+        self.assertEqual(row["status"], "已发")
+
+    def test_mark_published_params_time_in_date_falls_back(self):
+        # 复现 8/8 生产：LLM 把「8/7 19:45」整个当 date 参数，排期行 date 只有「8/7」——
+        # params 路径不能直接精确匹配就放弃，要剥出 M/D + 按标题模糊匹配落到 待产 行
+        scheduler.add_entry({"date": "8/7", "publish_time": "19:45", "content_type": "曝光",
+                             "topic": "孩子偏科，国内一次考试定终身；新加坡同一所中学，数学能上最难、英语能上最基础",
+                             "goal": "拉新", "status": "待产", "owner": "张艺宝", "data": "—",
+                             "script": "", "source_chat": "oc_03cf63d38a3b6f6090125d08b2f59705"})
+        controller._planner = lambda msg, content, history, rounds: PlanResult(
+            "", "确认已发布", "",
+            {"date": "8/7 19:45",
+             "topic": "孩子偏科，国内一次考试定终身；新加坡同一所中学，数学能上最难、英语能上最基础"})
+        out = handle_message(msg("这个我昨天在另一个群里已确认发布，你这有记录么"))
+        row = next(r for r in scheduler.load_schedule()
+                   if r["topic"] == "孩子偏科，国内一次考试定终身；新加坡同一所中学，数学能上最难、英语能上最基础")
+        self.assertEqual(row["status"], "已发")
+        self.assertIn("已发状态：确认", "".join(m.text for m in out))
+
+    def test_mark_published_tolerates_date_typo_when_topic_unique(self):
+        # 复现 8/8 生产：老板报「8/3 19岁本科毕业…已发布」，排期行是 8/8 ——
+        # 日期对不上但标题在待发行里唯一命中 → 容忍笔误按 8/8 标已发，回执里注明
+        scheduler.add_entry({"date": "8/8", "publish_time": "18:15", "content_type": "留资",
+                             "topic": "19岁本科毕业，在新加坡能找到什么工作？真实工资单给你看",
+                             "goal": "拉新", "status": "待产", "owner": "张艺宝", "data": "—",
+                             "script": "", "source_chat": "oc_t"})
+        out = handle_message(msg("8/3 19岁本科毕业，在新加坡能找到什么工作？真实工资单给你看 已发布"))
+        row = next(r for r in scheduler.load_schedule()
+                   if r["topic"] == "19岁本科毕业，在新加坡能找到什么工作？真实工资单给你看")
+        self.assertEqual(row["status"], "已发")
+        joined = "".join(m.text for m in out)
+        self.assertIn("已发状态：确认", joined)
+        self.assertIn("表里是 8/8", joined)
+
+    def test_mark_published_date_mismatch_ambiguous_no_tolerance(self):
+        # 日期对不上且标题同时撞上多条待发行 → 不猜，仍回「未找到对应待发条目」
+        scheduler.add_entry({"date": "8/8", "publish_time": "18:15", "content_type": "留资",
+                             "topic": "19岁本科毕业，在新加坡能找到什么工作？真实工资单给你看",
+                             "goal": "拉新", "status": "待产", "owner": "张艺宝", "data": "—",
+                             "script": "", "source_chat": "oc_t"})
+        scheduler.add_entry({"date": "8/9", "publish_time": "18:15", "content_type": "留资",
+                             "topic": "19岁本科毕业，在新加坡能找到什么工作",
+                             "goal": "拉新", "status": "待产", "owner": "张艺宝", "data": "—",
+                             "script": "", "source_chat": "oc_t"})
+        out = handle_message(msg("8/3 19岁本科毕业，在新加坡能找到什么工作？真实工资单给你看 已发布"))
+        mine = [r for r in scheduler.load_schedule() if "19岁本科毕业" in r["topic"]]
+        self.assertEqual(len(mine), 2)
+        self.assertTrue(all(r["status"] in ("待产", "待发") for r in mine))
+        self.assertIn("未找到对应待发条目", "".join(m.text for m in out))
+
+    def test_view_schedule_hard_anchor_beats_planner(self):
+        # 复现 8/8 生产：LLM 把「看一下表格」误判成确认已发布 → 硬锚先于 planner 拦截，直接看排期表、不误标
+        controller._planner = lambda m, c, h, r: PlanResult("", "确认已发布", "", {})
+        out = handle_message(msg("看一下表格"))
+        joined = "".join(m.text for m in out)
+        self.assertTrue("排期" in joined or "多维表格" in joined)
+        self.assertNotIn("已发状态", joined)
+        self.assertEqual(scheduler.load_schedule()[0]["status"], "待发")
+
+    def test_publish_guard_blocks_no_confirm_word(self):
+        # LLM 误判确认已发布但原文无「已发布/发了」等确认词 → 防呆拦截，不执行标已发
+        controller._planner = lambda m, c, h, r: PlanResult("", "确认已发布", "", {})
+        out = handle_message(msg("把表格状态调一下"))
+        joined = "".join(m.text for m in out)
+        self.assertIn("标哪条已发布", joined)
+        self.assertNotIn("已发状态", joined)
+        self.assertEqual(scheduler.load_schedule()[0]["status"], "待发")
+
+    def test_publish_guard_allows_with_confirm_word(self):
+        # LLM 判确认已发布且原文含「已发布」→ 放行正常标已发
+        controller._planner = lambda m, c, h, r: PlanResult("", "确认已发布", "", {})
+        out = handle_message(msg("8/8 普娃逆袭已发布"))
+        self.assertEqual(scheduler.load_schedule()[0]["status"], "已发")
+        self.assertIn("已发状态：确认", "".join(m.text for m in out))
+
+    def test_mark_published_with_data_chains_reflow(self):
+        # 一条消息既说已发布又给数据 → 先标已发，再连动回流完成
+        scheduler.add_entry({"date": "8/7", "publish_time": "19:17", "content_type": "信任",
+                             "topic": "新加坡私校集体收紧，初中直通本科这条路要断了吗？",
+                             "goal": "留资", "status": "待发", "owner": "发片同事", "data": "—",
+                             "script": "", "source_chat": "oc_t"})
+        out = handle_message(msg("《新加坡私校集体收紧，初中直通本科这条路要断了吗？》已发布，播放2.1w 留资23"))
+        rows = scheduler.load_schedule()
+        target = next(r for r in rows if "新加坡私校" in r["topic"])
+        self.assertEqual(target["status"], "回流完成")
+        self.assertIn("播放2.1w", target["data"])
+
+    def test_reflow_pending_data_applies_on_later_publish(self):
+        # 老板先报数据（当时排期表没有「已发」条目）→ 暂存 → 后确认某条「已发布」→ 自动回流
+        out = handle_message(msg("昨天发布的视频今日浏览3450，点赞87，评论3，收藏2，转发3，为我录入；并且复盘"))
+        text = "".join(m.text for m in out)
+        self.assertIn("数据已记下", text)
+        self.assertNotIn("没有待回流数据", text)
+        out2 = handle_message(msg("8/3普娃逆袭已发布"))
+        text2 = "".join(m.text for m in out2)
+        self.assertIn("数据已回流", text2)
+        row = scheduler.load_schedule()[0]
+        self.assertEqual(row["status"], "回流完成")
+        self.assertIn("3450", row["data"])
+        self.assertNotIn("oc_t", controller._pending_reflow)
+
+    def test_reflow_pending_topic_hint_waits_for_matching_publish(self):
+        # 带选题报数据但该条还没标已发 → 暂存带标题 → 确认的是另一条不误配，确认正确那条才回流
+        out = handle_message(msg("8/3普娃逆袭 播放2.1w 留资23"))
+        self.assertIn("数据已记下", "".join(m.text for m in out))
+        scheduler.add_entry({"date": "8/7", "publish_time": "19:17", "content_type": "信任",
+                             "topic": "新加坡私校集体收紧，初中直通本科这条路要断了吗？",
+                             "goal": "留资", "status": "待产", "owner": "发片同事", "data": "—",
+                             "script": "", "source_chat": "oc_t"})
+        handle_message(msg("《新加坡私校集体收紧，初中直通本科这条路要断了吗？》已发布"))
+        other = [r for r in scheduler.load_schedule() if "新加坡私校" in r["topic"]][0]
+        self.assertEqual(other["status"], "已发")
+        self.assertEqual(other["data"], "待回流")  # 暂存带标题不匹配 → 不误配
+        out3 = handle_message(msg("8/3普娃逆袭已发布"))
+        self.assertIn("数据已回流", "".join(m.text for m in out3))
+        row = [r for r in scheduler.load_schedule() if r["topic"] == "普娃逆袭"][0]
+        self.assertEqual(row["status"], "回流完成")
+        self.assertIn("播放2.1w", row["data"])
+
+    def test_reflow_pending_expires_not_applied(self):
+        # 暂存超过 TTL → 确认已发布只标已发，不补回流（防数据串台到隔太久的视频）
+        handle_message(msg("昨天发布的视频今日浏览3450，点赞87，评论3，收藏2，转发3，为我录入；并且复盘"))
+        controller._pending_reflow["oc_t"]["ts"] = time.time() - controller._PENDING_REFLOW_TTL - 60
+        out = handle_message(msg("8/3普娃逆袭已发布"))
+        row = scheduler.load_schedule()[0]
+        self.assertEqual(row["status"], "已发")
+        self.assertEqual(row["data"], "待回流")
+        self.assertNotIn("数据已回流", "".join(m.text for m in out))
 
     def test_market_refresh_posts_result(self):
         with mock.patch.object(controller.market, "refresh", return_value={"hot": 2, "leads": 1}):
@@ -1294,6 +1523,24 @@ class TestController(unittest.TestCase):
         with mock.patch.object(controller, "add_entry") as add:
             controller._exec_change_schedule(msg("下周三要3条曝光"), "下周三要3条曝光", "", [], replies, {})
         self.assertEqual(add.call_count, 3)
+
+    def test_schedule_entries_no_count_returns_empty(self):
+        # 无明确数量（只给日期/负责人）→ 不编占位行，返回空列表由上层问细节
+        self.assertEqual(controller._schedule_entries({}, "排8/8 18:15 负责人张艺宝"), [])
+
+    def test_schedule_entries_explicit_count_from_content(self):
+        # 内容带数量「下周三要3条曝光」→ 编 3 条批量行
+        entries = controller._schedule_entries({}, "下周三要3条曝光")
+        self.assertEqual(len(entries), 3)
+        self.assertTrue(all(e["content_type"] == "曝光" for e in entries))
+
+    def test_schedule_no_count_asks_not_fabricate(self):
+        # 有排期意图但没数量/选题、也无刚定稿上下文 → 明说失败，绝不编占位
+        replies = []
+        with mock.patch.object(controller, "add_entry") as add:
+            controller._exec_change_schedule(msg("排8/8 18:15 负责人张艺宝"), "排8/8 18:15 负责人张艺宝", "", [], replies, {})
+        add.assert_not_called()
+        self.assertTrue(any("哪条选题" in r.text or "排几条" in r.text for r in replies))
 
     def test_add_column_script_content_boss(self):
         with mock.patch.object(controller.base_bridge, "add_column") as ac, \

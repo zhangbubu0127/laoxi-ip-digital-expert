@@ -204,6 +204,13 @@ class TestByKeyword(unittest.TestCase):
         self.assertEqual(by_keyword("搜竞对").intent, "更新市场情报")
         self.assertEqual(by_keyword("现在什么话题热").intent, "更新市场情报")
 
+    def test_research_synonym(self):
+        self.assertEqual(by_keyword("调研一下新加坡低龄留学政策").intent, "调研")
+        self.assertEqual(by_keyword("帮我查查市场行情").intent, "调研")
+        self.assertEqual(by_keyword("了解下最新政策").intent, "调研")
+        # 调研优先于出选题：含「选题」不被出选题误吞
+        self.assertEqual(by_keyword("调研下这个选题方向").intent, "调研")
+
     def test_used_topic_synonym(self):
         # 「查已用选题」优先于「出选题」：含「选题」也不被出选题误吞
         self.assertEqual(by_keyword("看已用选题").intent, "查已用选题")

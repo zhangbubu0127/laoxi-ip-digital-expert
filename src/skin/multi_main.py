@@ -55,7 +55,7 @@ def _run_expert(role: str, entry: dict) -> None:
                         if details:
                             context_store.save_review(msg.chat_id, role, details)
                         text = public
-                    if role == "席小题" and "【依据】" in text:
+                    if role == "席小题" and "【依据】" in text and not task.startswith("【调研】"):
                         if "圆桌" in task:
                             lark_bridge.send_reply(msg.chat_id, text, profile)
                         else:
