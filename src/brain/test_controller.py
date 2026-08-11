@@ -590,6 +590,33 @@ class TestController(unittest.TestCase):
             self.assertIsNone(self.xiaoti.last_explain_context)
             self.assertTrue(any(m.agent_tag == "席小题" and "1.依据A" in m.text for m in out))
 
+    def test_ask_basis_picks_nth(self):
+        # 8/11 bad case：老板只要「选题四的依据」→ 只回第 4 条，不 dump 全部依据
+        with mock.patch.object(controller.context_store, "load_basis",
+                               return_value=("1.选题A\n2.选题B\n3.选题C\n4.选题D",
+                                             "1.依据A\n2.依据B\n3.依据C\n4.依据D")):
+            handle_message(msg("帮我出3个选题"))
+            out = handle_message(msg("给我选题四的依据"))
+            joined = "".join(m.text for m in out)
+            self.assertIn("选题4「选题D」", joined)
+            self.assertIn("依据D", joined)
+            self.assertNotIn("依据A", joined)
+            self.assertNotIn("依据B", joined)
+            out2 = handle_message(msg("给我选题二的依据"))
+            joined2 = "".join(m.text for m in out2)
+            self.assertIn("选题2「选题B」", joined2)
+            self.assertNotIn("依据A", joined2)
+
+    def test_ask_basis_fallback_all_when_no_index(self):
+        # 无序号（「给我依据」）→ 兜底仍回全部依据，不丢功能
+        with mock.patch.object(controller.context_store, "load_basis",
+                               return_value=("1.选题A\n2.选题B", "1.依据A\n2.依据B")):
+            handle_message(msg("帮我出3个选题"))
+            out = handle_message(msg("给我依据"))
+            joined = "".join(m.text for m in out)
+            self.assertIn("依据A", joined)
+            self.assertIn("依据B", joined)
+
     def test_record_material_saves(self):
         out = handle_message(msg("记素材：普娃预算对比，三年比国内省12万"))
         self.assertTrue(any("已存素材" in m.text for m in out))
@@ -766,6 +793,38 @@ class TestController(unittest.TestCase):
         rows = scheduler.load_schedule()
         target = next(r for r in rows if "新加坡私校" in r["topic"])
         self.assertEqual(target["status"], "已发")
+
+    def test_mark_published_uses_last_passed_context_no_date(self):
+        # 复现 8/10 测试群：老板只回「已核对好，可以确定是已发了」，刚定稿刚排期——
+        # 消息无日期+标题，回落最近定稿选题（_last_passed）唯一命中待发行 → 标已发，不扔「没找到」
+        controller._last_passed["oc_t"] = {"topic": "孩子国内上课都坐不住，去新加坡英文授课能毕业吗？",
+                                           "content_type": "信任"}
+        scheduler.add_entry({"date": "8/10", "publish_time": "17:38", "content_type": "信任",
+                             "topic": "孩子国内上课都坐不住，去新加坡英文授课能毕业吗？真实毕业率老席讲给你听",
+                             "goal": "拉新", "status": "待产", "owner": "张艺宝", "data": "—",
+                             "script": "", "source_chat": "oc_t"})
+        controller._planner = lambda msg, content, history, rounds: PlanResult("", "确认已发布", "", {})
+        out = handle_message(msg("已核对好，可以确定是已发了"))
+        row = next(r for r in scheduler.load_schedule() if "坐不住" in r["topic"])
+        self.assertEqual(row["status"], "已发")
+        self.assertIn("已发状态：确认", "".join(m.text for m in out))
+
+    def test_mark_published_last_passed_ambiguous_asks_not_guess(self):
+        # 回落 _last_passed 时若待发行撞题歧义 → 不猜，明说让老板补日期/标题
+        controller._last_passed["oc_t"] = {"topic": "孩子上课坐不住", "content_type": "信任"}
+        scheduler.add_entry({"date": "8/10", "publish_time": "17:38", "content_type": "信任",
+                             "topic": "孩子上课坐不住，去新加坡能毕业吗",
+                             "goal": "拉新", "status": "待产", "owner": "张艺宝", "data": "—",
+                             "script": "", "source_chat": "oc_t"})
+        scheduler.add_entry({"date": "8/11", "publish_time": "10:00", "content_type": "信任",
+                             "topic": "孩子上课坐不住，去新加坡怎么办",
+                             "goal": "拉新", "status": "待发", "owner": "张艺宝", "data": "—",
+                             "script": "", "source_chat": "oc_t"})
+        controller._planner = lambda msg, content, history, rounds: PlanResult("", "确认已发布", "", {})
+        out = handle_message(msg("已核对好，可以确定是已发了"))
+        rows = [r for r in scheduler.load_schedule() if r["status"] == "已发"]
+        self.assertEqual(rows, [], "撞题歧义不得乱标已发")
+        self.assertIn("说下日期", "".join(m.text for m in out))
 
     def test_mark_published_uses_planner_params(self):
         # planner 给结构化 date/topic → 标已发直接用，不依赖 content 格式
@@ -1296,6 +1355,56 @@ class TestController(unittest.TestCase):
         self.assertTrue(wen_tags)
         self.assertIn("费用按8万算没问题", wen_tags[-1])
         self.assertIn("修改这条脚本", wen_tags[-1])
+
+    def test_wait_boss_concrete_edit_with_pass_word_goes_modify(self):
+        # 复现 8/10：席小核疑问 v3「早六年上班」→ 老板回「早三年吧，然后就可以了」——
+        # 消息含放行词「可以了」但实质是改稿指令 → 不能只认「可以了」定稿，要走 落规则+席小文修改
+        controller._pipelines["oc_t"] = {"step": "wait_boss", "script": "【席小文】## 脚本 v1",
+                                         "reviewer": "【审核结论】需老板确认\nv3里「早六年上班，早六年挣工资」",
+                                         "fix_rounds": 0, "ts": 0}
+        emitted = []
+        controller._emit = lambda chat_id, text, tag: emitted.append((chat_id, text, tag))
+        def fake_by_role(role):
+            return {"profile": role, "open_id": f"ou_{role}"}
+        with mock.patch.object(controller.bots, "by_role", fake_by_role):
+            out = handle_message(msg("早三年吧，然后就可以了", role="老板"))
+        joined = "".join(r.text for r in out)
+        self.assertIn("收到老板答案", joined)          # 走 落规则+修改 路径
+        self.assertNotIn("写脚本流水线完成", joined)   # 不能当放行定稿进排期询问
+        self.assertEqual(controller._pipelines["oc_t"]["step"], "wait_fix")
+        self.assertTrue(any("早三年吧" in r["rule"] for r in rules.load_rules()))
+        wen_tags = [t for _, t, tag in emitted if tag == "席小文"]
+        self.assertTrue(wen_tags)
+        self.assertIn("早三年吧", wen_tags[-1])
+
+    def test_resolve_doubt_learns_via_xiaoxi(self):
+        # 老板拍板实质答案 → 除原文规则外，席小习同步拆解落已确认规则（Fix B）
+        controller._pipelines["oc_t"] = {"step": "wait_boss", "script": "【席小文】## 脚本 v1",
+                                         "reviewer": "【审核结论】需老板确认\nv3里「早六年上班，早六年挣工资」",
+                                         "fix_rounds": 0, "ts": 0}
+        self.xiaoxi.text = '{"rules":[{"change":"老板拍板「早三年吧」","rule":"排期年限用软性表达不写死","type":"表达偏好"}]}'
+        emitted = []
+        controller._emit = lambda chat_id, text, tag: emitted.append((chat_id, text, tag))
+        def fake_by_role(role):
+            return {"profile": role, "open_id": f"ou_{role}"}
+        with mock.patch.object(controller.bots, "by_role", fake_by_role):
+            out = handle_message(msg("早三年吧，然后就可以了", role="老板"))
+        joined = "".join(r.text for r in out)
+        self.assertIn("收到老板答案", joined)
+        rules_list = rules.load_rules()
+        self.assertTrue(any(r["status"] == "已确认" and "排期年限用软性表达不写死" in r["rule"]
+                            for r in rules_list))
+        self.assertIn("早三年吧", self.xiaoxi.last_task)
+        self.assertIn("【AI原版/审核稿】", self.xiaoxi.last_context)
+        self.assertIn("需老板确认", self.xiaoxi.last_context)
+
+    def test_wait_boss_negated_change_words_still_pass(self):
+        # 「不用改/别改」等放行话术含「改」字但不能误判成改稿指令
+        controller._pipelines["oc_t"] = {"step": "wait_boss", "script": "脚本",
+                                         "reviewer": "需老板确认", "fix_rounds": 0, "ts": 0}
+        out = handle_message(msg("不用改，可以了", role="老板"))
+        self.assertTrue(any("上排期" in r.text for r in out))
+        self.assertEqual(controller._pipelines["oc_t"]["step"], "wait_schedule")
 
     def test_boss_abort_cancels(self):
         controller._pipelines["oc_t"] = {"step": "wait_boss", "script": "脚本",

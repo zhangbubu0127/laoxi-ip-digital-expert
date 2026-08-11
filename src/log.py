@@ -7,9 +7,15 @@ _RETENTION_DAYS = 30
 
 
 def _compress_file(path: str) -> None:
-    with open(path, "rb") as f_in, gzip.open(path + ".gz", "wb") as f_out:
-        f_out.write(f_in.read())
-    os.remove(path)
+    # 幂等：多进程并行启动时旧日志可能已被另一进程压缩成 .gz，文件不在直接跳过
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, "rb") as f_in, gzip.open(path + ".gz", "wb") as f_out:
+            f_out.write(f_in.read())
+        os.remove(path)
+    except FileNotFoundError:
+        pass
 
 
 def _cleanup() -> None:
@@ -53,7 +59,10 @@ class _DailyGzHandler(logging.Handler):
             return
         if self._stream is not None:
             self._stream.close()
-            _compress_file(self._stream.name)
+            try:
+                _compress_file(self._stream.name)
+            except Exception:
+                pass  # 压缩失败不阻塞切换，记录照样落新文件
             self._stream = None
         self._day = day
         self._stream = open(os.path.join(self._log_dir, f"system-{day}.log"), "a", encoding="utf-8")

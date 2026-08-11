@@ -15,6 +15,7 @@ from brain.experts.xiaone import XiaoneExpert, split_review
 from brain.experts.xiaoxi import XiaoxiExpert
 from brain.experts.fupan import FupanExpert
 from brain.experts.dispatch import run_expert, EXPLAIN_MARK, LEARN_MARK, parse_learned_rules
+from brain import basis as basis_util
 from brain import context_store, market
 from skin import bots, identity, base_bridge
 
@@ -715,7 +716,7 @@ def _exec_review_reasons(msg: InboundMessage, content: str, task: str, rounds: l
 
 def _exec_mark_published(msg: InboundMessage, content: str, task: str, rounds: list, replies: list, params: dict | None = None) -> None:
     params = params or {}
-    ok = _try_mark_published(content, params)
+    ok = _try_mark_published(content, params, msg.chat_id)
     replies.append(OutboundMessage(msg.chat_id, f"已发状态：{ok}", "小席"))
     if ok != "确认" or _last_marked is None:
         return
@@ -1127,6 +1128,17 @@ def _ask(msg: InboundMessage, content: str, rounds: list, replies: list) -> None
     if speaker == "席小题":
         topics, basis = context_store.load_basis(msg.chat_id, "席小题")
         if basis:
+            n = basis_util.match_index(content)
+            if n:
+                hit = next((basis_util.item_reply(num, topic, reason)
+                            for num, topic, reason in basis_util.paired_topics(topics, basis)
+                            if num == n), None)
+                if hit:
+                    _log.info("追问 席小题依据 → 直发第 %s 条依据（真实句，不重生成）", n)
+                    replies.append(OutboundMessage(msg.chat_id, hit, "席小题"))
+                    return
+                replies.append(OutboundMessage(msg.chat_id, f"没找到第 {n} 个选题的依据。", "席小题"))
+                return
             _log.info("追问 席小题依据 → 直发存档依据（真实句，不重生成）")
             replies.append(OutboundMessage(msg.chat_id,
                                            f"依据如下（席小题出题时写的，第 N 条对应第 N 个选题）：\n{basis}", "席小题"))
@@ -1279,6 +1291,18 @@ def _is_pass(content: str) -> bool:
     c = content.strip()
     return any(p in c for p in _PASS_HINTS) or c in _PASS_EXACT
 
+# 老板拍板消息里同时带「实质修改 + 放行词」（如「早三年吧，然后就可以了」）时，放行词不能抢在改稿指令前——
+# 否则「早三年」这类实质答案被「可以了」吞掉直接定稿。数字量词或肯定改稿动词 → 判实质修改。
+_MODIFY_VERBS = ("改成", "换成", "写成", "改为", "调成", "删掉", "去掉", "加上", "加个", "挪到")
+_MODIFY_QUANT = re.compile(r"\d+|[一二三四五六七八九十两](?:年|万|岁|个|条|月|天|小时|点)")
+_NEGATED_CHANGE = ("不用改", "别改", "不用再改", "不改了")
+
+def _has_concrete_modification(content: str) -> bool:
+    c = content or ""
+    if any(w in c for w in _NEGATED_CHANGE):
+        return False
+    return bool(_MODIFY_QUANT.search(c)) or any(v in c for v in _MODIFY_VERBS)
+
 def _ask_schedule(chat_id: str, script: str, replies: list) -> None:
     """定稿出口统一问排期：审核通过或老板放行后，@提出者 等排期信息（排哪天/负责人）。"""
     _pipelines[chat_id] = {"step": "wait_schedule", "script": script, "ts": time.time()}
@@ -1298,7 +1322,9 @@ def _resolve_doubt(msg: InboundMessage, content: str, rounds: list, replies: lis
         _post(msg.chat_id, replies, "小席", "已取消本次修改，脚本保持原样，要改随时说。")
         _remember(msg, replies)
         return
-    if _is_pass(content):
+    if _has_concrete_modification(content):
+        _log.info("老板答复含实质修改（有数字量词/改稿动词）→ 走改稿，放行词不抢先")
+    elif _is_pass(content):
         _record_passed(msg.chat_id)
         _ask_schedule(msg.chat_id, pipe["script"], replies)
         _remember(msg, replies)
@@ -1311,6 +1337,16 @@ def _resolve_doubt(msg: InboundMessage, content: str, rounds: list, replies: lis
     except Exception as e:
         _log.error("记录疑问答案规则失败: %s", e)
     first = pipe["reviewer"].strip().split(chr(10), 1)[0]
+    # 老板拍板实质答案 → 席小习同步拆解差异并直接落已确认规则（老板已拍板，不引入二次确认；失败不影响主流程）
+    try:
+        xctx = f"【AI原版/审核稿】\n{_cap(pipe['script'], 300)}\n\n【审核疑问】\n{first}"
+        xtext = _controller_factories()["席小习"]().handle(
+            f"{answer}\n把老板这段确定答案拆解成审核/写作规则，直接给 JSON。", context=xctx)
+        for change, rule, rtype in parse_learned_rules(xtext)[:3]:
+            rules.add_confirmed_rule(change, rule,
+                                     style_user=_last_style.get(msg.chat_id, "老席"), rtype=rtype)
+    except Exception as e:
+        _log.error("席小习拆解拍板答案失败: %s", e)
     fix_task = (f"审核未通过，按老板的确定答案修改这条脚本。\n老板答案：{answer}\n"
                 f"审核意见：{first}\n直接输出改好的完整新版脚本，不用解释过程。")
     _dispatch_expert(msg.chat_id, replies, "席小文", fix_task, pipe["script"])
@@ -1718,7 +1754,7 @@ def _publish_reply(row: dict, date_mismatch: bool, reported_date: str) -> str:
         return f"确认（注：你报的日期 {reported_date} 表里是 {row['date']}，已按表里 {row['date']} 确认）"
     return "确认"
 
-def _try_mark_published(content: str, params: dict | None = None) -> str:
+def _try_mark_published(content: str, params: dict | None = None, chat_id: str = "") -> str:
     global _last_marked
     params = params or {}
     _last_marked = None
@@ -1745,6 +1781,22 @@ def _try_mark_published(content: str, params: dict | None = None) -> str:
                     _last_marked = (r["date"], r["topic"])
                     return "确认"
                 return "未找到对应待发条目"
+    # 无日期+标题也模糊不到 → 回落「最近定稿的选题」（刚讨论/刚上排期表那条），唯一命中才标，撞题不猜
+    if chat_id:
+        lp = _last_passed.get(chat_id) or {}
+        lp_topic = _normalize_topic(lp.get("topic", ""))
+        if lp_topic:
+            rows = [r for r in load_schedule()
+                    if r["status"] in ("待产", "待发")
+                    and _fuzzy_topic_match(lp_topic, _normalize_topic(r["topic"]))]
+            if len(rows) == 1:
+                r = rows[0]
+                if mark_published(r["date"], r["topic"]):
+                    _last_marked = (r["date"], r["topic"])
+                    return "确认"
+                return "未找到对应待发条目"
+            if len(rows) > 1:
+                return "待发行里有几条都能对上刚讨论的选题，说下日期或标题，我好确认是标哪条已发。"
     return "没找到匹配的待发条目，说清日期+标题（如「8/3 普娃逆袭 已发布」）"
 
 def _resolve_publish_row(date_hint: str, topic_hint: str) -> tuple[dict | None, bool]:
