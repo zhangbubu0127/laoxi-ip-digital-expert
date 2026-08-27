@@ -17,13 +17,13 @@
 | 微博 | WebSearch：微博热议/网络舆情 | 提到新加坡的社会热点（城市形象/民生/明星） | 当天表 |
 | 知乎 | WebSearch：知乎问答 | 家长关心的讨论（实时热榜难搜，尽力而为） | 当天表 |
 | 虎扑 | WebSearch：虎扑步行街/社区帖 | 男性/年轻人视角的新加坡生活·物价·身份吐槽（真实帖URL，无精确数据） | 当天表 |
-| 抖音 | WebSearch：公开视频索引 | 话题+真实视频URL，无精确数据 | 当天表 + 长期库 |
-| 小红书 | WebSearch：媒体转述+关键词 | 提到新加坡的公开话题，无原生笔记URL | 当天表 + 长期库 |
+| 抖音 | Playwright 小号登录搜索，按点赞排序 | 真实点赞数+作者+视频URL | 当天表 + 长期库 |
+| 小红书 | Playwright 小号登录搜索 | 真实点赞/收藏/评论+作者+笔记URL | 当天表 + 长期库 |
 | B站最新 | B站接口 order=pubdate（近~120天） | 真实播放量+发布日期 | 当天表 |
 | B站常青 | B站接口 order=click（历史高播放） | 家长长期关心的话题池 | 长期库 |
 
-- **抖音**：搜索能拿到真实可访问的视频 URL；精确播放/点赞拿不到（需 Playwright，暂不做）。
-- **小红书**：站内笔记对搜索引擎屏蔽，拿不到原生笔记 URL，只能收"媒体转述小红书现象"的报道链接；要原生笔记只能走 Playwright+小号（暂不做）。
+- **抖音**：Playwright 小号登录，搜索页按点赞排序（`sort_type=1`），从 `a.innerText` 按行解析标题/点赞/作者。热度分级：>=10万=高，>=3万=中，<3万=低。搜索结果页只有点赞数，评论/收藏/转发需逐个打开视频页，不采集。
+- **小红书**：Playwright 小号登录，从 `card.innerText` 按行解析标题/作者/点赞。热度分级：点赞+收藏>=5000=高，>=1000=中，<1000=低。搜索结果页点赞≈收藏（同一数字）。
 - **知乎/微博**：能搜到被索引的问答/热议，但不是实时热榜 API；niche 话题上榜少，广撒网收录。
 - 视频号已排除：无公开 API，DIY 做不到。
 
@@ -36,17 +36,18 @@
   CLAUDE.md              # 本文件，先读
   keywords.txt           # 关键词池，一行一个
   scrapers/bilibili.py   # B站，纯代码+wbi签名
-  scrapers/douyin_playwright.py  # 抖音，Playwright 小号
-  run.py                 # 聚合去重 + 分流写飞书
-  config.json            # 飞书 base_token（gitignore，不入库）
+  scrapers/douyin_playwright.py  # 抖音，Playwright 小号（按点赞排序，抓真实数据）
+  scrapers/xhs_playwright.py     # 小红书，Playwright 小号（抓点赞/收藏/评论）
+  run.py                 # 聚合去重 + 分流写飞书 + 群聊推送
+  config.json            # 飞书 base_token + push_chat_id（gitignore，不入库）
   output/
     search_input.json    # 当天各平台热点 → 当天表，每天覆盖写
-    evergreen_input.json # 抖音/小红书公开话题池 → 当天表+长期库，增量补充
+    evergreen_input.json # 抖音/小红书采集器产出 → 当天表+长期库，增量补充
     radar_YYYY-MM-DD.{md,csv}  # 每日本地产出
     edu_compare.json     # 中新教育对比（同步给席小题做差异化卖点）
 ```
 
-- **GitHub 安全**：`config.json`（base_token）、`scrapers/.douyin_profile/`（抖音登录态）、`output/`、`.venv/` 已在老席仓库 `.gitignore`，裸 `git add .` 不会带上。
+- **GitHub 安全**：`config.json`（base_token/push_chat_id）、`scrapers/.douyin_profile/`（抖音登录态）、`scrapers/.xhs_profile/`（小红书登录态）、`output/`、`.venv/` 已在老席仓库 `.gitignore`，裸 `git add .` 不会带上。
 - **运行时**：老席系统 python3 已装 requests/playwright，`python3 run.py` 直接可用，无需自带 venv。
 
 ## 硬规则
@@ -72,18 +73,21 @@
 
 触发词：用户在**本项目目录**启动的会话里说「更新雷达」。收到后按顺序执行：
 
-1. **搜当天各平台热点**：用 WebSearch 广搜今天"新加坡 / 新加坡留学"话题，覆盖新闻/门户/垂直媒体 + **微博热议 + 知乎问答 + 抖音 + 小红书**。**固定加一组"家长视角"关键词**：`新加坡留学 家长关心的事`、`新加坡留学 要重视的事情`、`低龄留学 家长 后悔/真实经历`——专挖家长焦虑、决策逻辑、避坑真相（做爆款文案的素材）。每条必须有真实出处链接，严禁编造。能看到内容的按真实热度+家长关心筛；看不到内容的（小红书/抖音评论区/视频号）我给广的话题线索，用户手动挖，全收不漏点。
-2. **写输入文件**（字段：话题/类别/平台/热度/热度数据/出处链接）：
-   - 当天各平台热点（全网/微博/知乎/抖音/小红书）→ **覆盖写** `output/search_input.json`
-   - 抖音/小红书长期话题池 → 补进 `output/evergreen_input.json`（同时进当天表和长期库）
+1. **跑抖音+小红书采集器**（纯代码，自动执行）：
+   - `cd radar && .venv/bin/python scrapers/douyin_playwright.py search`
+   - `cd radar && .venv/bin/python scrapers/xhs_playwright.py search`
+   - 采集器自动写入 `output/evergreen_input.json`，含真实点赞/收藏/作者数据
+2. **搜当天各平台热点**：用 WebSearch 广搜今天"新加坡 / 新加坡留学"话题，覆盖新闻/门户/垂直媒体 + **微博热议 + 知乎问答**。**固定加一组"家长视角"关键词**：`新加坡留学 家长关心的事`、`新加坡留学 要重视的事情`、`低龄留学 家长 后悔/真实经历`——专挖家长焦虑、决策逻辑、避坑真相（做爆款文案的素材）。每条必须有真实出处链接，严禁编造。
+3. **写输入文件**（字段：话题/类别/平台/热度/热度数据/出处链接）：
+   - 当天各平台热点（全网/微博/知乎）→ **覆盖写** `output/search_input.json`
    - 类别：留学政策 / 低龄留学 / 费用签证 / 综合话题；热度：高/中/低（定性）
-   - 平台如实填（全网/知乎/微博/抖音/小红书）；热度数据填定性描述，不伪造点赞/播放数
+   - 平台如实填（全网/知乎/微博）；热度数据填定性描述，不伪造点赞/播放数
    - 来源黑名单：不用知乎洗稿页、微信公众号（不可靠），优先狮城论坛/垂直媒体/权威新闻的实链接
-3. **跑聚合**：`python3 run.py`（自动抓 B站真实数据 + 分流写两张飞书表 + 落本地 md/csv）。若新增了新平台，先给已有表的"平台"字段补 select 选项（`+field-update` 全量 PUT）。
-4. **同步席小题情报库**：`python3 <老席根>/scripts/sync_radar.py` —— 把当日产出同步进 `knowledge/竞对分析/热点话题.md`，席小题下次出选题自动带上市场热点。
-5. **报告**：当天看板各平台各几条、飞书看板链接。
+4. **跑聚合**：`python3 run.py`（自动抓 B站真实数据 + 读抖音/小红书采集器产出 + 分流写两张飞书表 + 推送群聊摘要 + 落本地 md/csv）。若新增了新平台，先给已有表的"平台"字段补 select 选项（`+field-update` 全量 PUT）。
+5. **同步席小题情报库**：`python3 <老席根>/scripts/sync_radar.py` —— 把当日产出同步进 `knowledge/竞对分析/热点话题.md`，席小题下次出选题自动带上市场热点。
+6. **报告**：当天看板各平台各几条、飞书看板链接（群聊已自动推送）。
 
-前提：全网搜索是 Claude 的 WebSearch 能力，独立脚本调不了，所以「更新雷达」只能在有 Claude 的会话里触发，不能设成纯 cron 定时任务。
+前提：全网搜索是 Claude 的 WebSearch 能力，独立脚本调不了，所以「更新雷达」只能在有 Claude 的会话里触发，不能设成纯 cron 定时任务。抖音/小红书采集器是纯代码，可单独跑。
 
 ## 验证方式
 

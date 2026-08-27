@@ -48,6 +48,7 @@ radar/             新加坡热点雷达（独立采集项目，每日产出热�
 - 智能体不能自动标「已发」——已发必须人工确认（发片同事回「已发布」）。
 - 不确定事实走「问老板」，禁止静默编造。
 - 知识库事实层只读；排期表主控唯一写权限；memory 学习层席小盘 agent 独写。
+- 业务事实双写同步（人工维护时）：`knowledge/业务事实/` 在录音蒸馏项目有副本（`~/Desktop/录音文件蒸馏成文章工作流/老席录音蒸馏智能体/knowledge/业务事实/`）。人工改任何一份业务事实，必须同步改另一份，保持两边一致；改完在 `docs/变更记录/` 当日文件留痕。
 - 异常一律「问老板」或「明说失败」，绝不静默。
 - 代码默认无注释；注释只在 WHY 非显然时写。
 - 不安装新的全局依赖。
@@ -79,7 +80,7 @@ radar/             新加坡热点雷达（独立采集项目，每日产出热�
 
 ## LLM 基本盘
 
-- 专家出内容必须走大模型：DeepSeek API，模型 `deepseek-v4-flash`（在 `config/secrets.json` 改）。
+- 专家出内容必须走大模型：MiMo API 主力（模型 `mimo-v2.5-pro`）+ DeepSeek 备用（在 `config/secrets.json` 改）。
 - API key 只放 gitignored 的 `config/secrets.json`，不进代码/commit/日志。
 - 架构：`src/brain/llm.py`（客户端）+ `knowledge.py`（知识库加载）+ 专家「读知识库→拼 prompt→调大模型」。
 - 席小核红线词本地规则拦截先行，再交 LLM 全量审核。

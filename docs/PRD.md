@@ -302,7 +302,7 @@
 |---|---|---|
 | 消息收发 | lark-cli（im.message.receive_v1 事件 / messages-send） | 已装已登录，验证过 |
 | 事件消费 | lark-cli event consume | 常驻监听群消息 |
-| 专家执行 | DeepSeek API（模型 deepseek-v4-flash） | 知识库驱动 prompt；key 走 gitignored secrets |
+| 专家执行 | MiMo API 主力（模型 mimo-v2.5-pro）+ DeepSeek 备用 | 知识库驱动 prompt；key 走 gitignored secrets |
 | 知识存储 | 本地 Markdown 文件 | 先文件后多维表格 |
 | 外搜核对 | 已实现 v1：Wikipedia API 免key（stdlib urllib），核不到标「需老板确认 · 低置信度」；有搜索 API key 可换 | 席小核用 |
 | 数据回流 | 笔记API（已做过）+ 人工兜底 | 搭完验证替代性 |

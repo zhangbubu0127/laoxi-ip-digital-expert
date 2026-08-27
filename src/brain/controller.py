@@ -241,17 +241,21 @@ def _write_script(msg: InboundMessage, content: str, task: str, rounds: list, re
     task = _apply_script_count(task, content, params)
     _log.info("派单 席小文 + 席小核")
     _post(msg.chat_id, replies, "小席", "写脚本进行中：席小文写作 → 席小核审核，两段约30-60秒…")
+    pipe_ts = time.time()
     wen = _dispatch_expert(msg.chat_id, replies, "席小文", task or content, _recent_context(rounds))
     if wen is None:
-        _pipelines[msg.chat_id] = {"step": "wait_wen", "content": content, "ts": time.time()}
+        _pipelines[msg.chat_id] = {"step": "wait_wen", "content": content, "ts": pipe_ts}
     else:
         _post(msg.chat_id, replies, "席小文", wen)
         he = _dispatch_expert(msg.chat_id, replies, "席小核", "审核这条脚本", f"【脚本原文】\n{wen}")
         if he is None:
-            _pipelines[msg.chat_id] = {"step": "wait_he", "script": wen, "ts": time.time()}
+            _pipelines[msg.chat_id] = {"step": "wait_he", "script": wen, "ts": pipe_ts}
         else:
             _post_xiaone(msg.chat_id, replies, he)
-            _post(msg.chat_id, replies, "小席", "写脚本流水线完成：席小文出稿 + 席小核审核已展示，要改直接说。")
+            elapsed = int(time.time() - pipe_ts)
+            t = f"{elapsed // 60} 分 {elapsed % 60} 秒" if elapsed >= 60 else f"{elapsed} 秒"
+            _post(msg.chat_id, replies, "小席",
+                  f"写脚本流水线完成：席小文出稿 + 席小核审核已展示，{t}，要改直接说。")
 
 def _resolve_style(msg: InboundMessage, content: str, rounds: list, replies: list) -> None:
     # 老板回答「按谁风格写」：登记该风格 → 用原请求重新派单
@@ -363,11 +367,22 @@ def _force_script_task(content: str, rounds: list) -> str:
         return ""
     return f"根据「{speaker}」的以下产出写脚本：\n{prev}"
 
-_PIPE_TIMEOUT = 180.0
+_PIPE_TIMEOUT = 300.0  # LLM 生成单次 30-100s，写作+审核两段轻松超 180s
 _MAX_FIX_ROUNDS = 2  # 席小核审核不通过时，自动 @席小文 修改的轮次上限，超了交给老板
 _REASON_YES = ("要", "要吧", "要的", "可以", "好的", "行", "看看", "看下", "展示", "想看")
 _pipelines = {}  # chat_id -> 异步编排状态（写脚本/圆桌/数据回流）
 _draft_ctx = {}  # chat_id -> (topic, content_type)：最近一次写脚本任务对应的选题，定稿时升格为 _last_passed
+
+
+def _elapsed_str(chat_id: str) -> str:
+    """从管线启动到现在过了多久，格式如「耗时 2 分 15 秒」。"""
+    pipe = _pipelines.get(chat_id)
+    if not pipe or not pipe.get("ts"):
+        return ""
+    secs = int(time.time() - pipe["ts"])
+    if secs < 60:
+        return f"耗时 {secs} 秒"
+    return f"耗时 {secs // 60} 分 {secs % 60} 秒"
 _last_passed = {}  # chat_id -> {"topic", "content_type"}：最近一次定稿的选题，供「这条选题通过了/排期发布」追溯
 _pending_action = {}  # chat_id -> {"action", "task", "ts"}：小席提议待老板点头后真执行的动作
 _last_style = {}  # chat_id -> 风格用户：最近一次写脚本用的说话风格（多个风格库时小席先问，之后复用）
@@ -461,8 +476,11 @@ def handle_bot_output(msg: InboundMessage) -> list:
             _pipelines[msg.chat_id] = {"step": "wait_he", "script": msg.content, "fix_rounds": 0, "ts": time.time()}
         else:
             _post(msg.chat_id, replies, "席小核", he)
+            elapsed = _elapsed_str(msg.chat_id)
             _pipelines.pop(msg.chat_id, None)
-            _post(msg.chat_id, replies, "小席", "写脚本流水线完成：席小文出稿 + 席小核审核已展示，要改直接说。")
+            tail = f"（{elapsed}）" if elapsed else ""
+            _post(msg.chat_id, replies, "小席",
+                  f"写脚本流水线完成：席小文出稿 + 席小核审核已展示{tail}，要改直接说。")
     elif step == "wait_he" and role == "席小核":
         verdict = _verdict_classify(msg.content)
         rounds_fix = pipe.get("fix_rounds", 0)
@@ -556,7 +574,11 @@ def sweep_pipelines() -> list:
             _post(cid, replies, "小席",
                   f"【圆桌纪要】议题：{p['subject']}\n{views}\n未给出意见：{missing}（超时）")
         else:
-            _post(cid, replies, "小席", "流水线超时：专家未在时限内回复，要重跑说一声。")
+            elapsed = int(time.time() - p.get("ts", time.time()))
+            t = f"{elapsed // 60} 分 {elapsed % 60} 秒" if elapsed >= 60 else f"{elapsed} 秒"
+            _post(cid, replies, "小席",
+                  f"写脚本流水线超时（已等 {t}），专家未在时限内回复。"
+                  "脚本可能还在生成中，稍等片刻；或重跑说一声。")
     return replies
 
 def _roundtable_summary(pipe: dict) -> str:
@@ -960,8 +982,11 @@ def handle_message(msg: InboundMessage) -> list[OutboundMessage]:
         return replies
     force = _force_script_task(content, rounds)
     if force:
-        _log.info("规划器未派活但命中产出指令，强制写脚本派单")
-        _write_script(msg, content, force, rounds, replies)
+        if msg.chat_id in _pipelines:
+            _log.info("规划器未派活但命中产出指令，已有活跃管线，跳过重复派单")
+        else:
+            _log.info("规划器未派活但命中产出指令，强制写脚本派单")
+            _write_script(msg, content, force, rounds, replies)
         _remember(msg, replies)
         return replies
     if not replies:
@@ -1305,9 +1330,11 @@ def _has_concrete_modification(content: str) -> bool:
 
 def _ask_schedule(chat_id: str, script: str, replies: list) -> None:
     """定稿出口统一问排期：审核通过或老板放行后，@提出者 等排期信息（排哪天/负责人）。"""
+    elapsed = _elapsed_str(chat_id)
     _pipelines[chat_id] = {"step": "wait_schedule", "script": script, "ts": time.time()}
+    tail = f"（{elapsed}）" if elapsed else ""
     _post(chat_id, replies, "小席",
-          f"{_requester_mention(chat_id)}写脚本流水线完成：席小文出稿 + 席小核审核通过。\n"
+          f"{_requester_mention(chat_id)}写脚本流水线完成：席小文出稿 + 席小核审核通过{tail}。\n"
           "要不要上排期表？排哪天几点？负责人是哪个发片同事？\n"
           "回「排 8/10 12:00」（负责人不写就默认发片同事），或「先不排」。")
 

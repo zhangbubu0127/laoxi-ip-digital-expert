@@ -28,10 +28,12 @@ import sys
 import json
 import time
 import random
+from datetime import date
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PROFILE_DIR = os.path.join(ROOT, "scrapers", ".douyin_profile")
 OUT_FILE = os.path.join(ROOT, "output", "evergreen_input.json")
+SEEN_FILE = os.path.join(ROOT, "output", "seen_urls.json")
 KEYWORDS_FILE = os.path.join(ROOT, "keywords.txt")
 
 # 搜索结果每关键词最多取几条
@@ -119,29 +121,69 @@ def cmd_login():
         ctx.close()
 
 
+def _parse_abbrev_num(s):
+    """"1.2w" -> 12000, "3456" -> 3456, "" -> 0."""
+    s = (s or "").strip().lower().replace(",", "")
+    if not s:
+        return 0
+    if s.endswith("w") or s.endswith("万"):
+        return int(float(s.rstrip("w万")) * 10000)
+    try:
+        return int(float(s))
+    except ValueError:
+        return 0
+
+
+def heat_douyin(likes):
+    likes = int(likes or 0)
+    if likes >= 100000:
+        return "高"
+    if likes >= 30000:
+        return "中"
+    return "低"
+
+
 def _extract_videos(page):
-    """从当前搜索页 DOM 抓 /video/ 卡片：返回 [(url, title)]。"""
+    """从当前搜索页 DOM 抓 /video/ 卡片：返回 [{url, title, author, likes, comments, collects, shares}]."""
     js = """
     () => {
-      const seen = {};
+      const results = {};
       document.querySelectorAll('a[href*="/video/"]').forEach(a => {
         const m = a.href.match(/\\/video\\/(\\d+)/);
         if (!m) return;
         const id = m[1];
-        // 标题优先级：aria-label > 内部img的alt > 链接文本
-        let t = a.getAttribute('aria-label') || '';
-        if (!t) { const img = a.querySelector('img[alt]'); if (img) t = img.alt; }
-        if (!t) t = (a.innerText || '').trim();
-        t = (t || '').replace(/\\s+/g, ' ').trim();
-        if (!seen[id] || (t && t.length > (seen[id]||'').length)) seen[id] = t;
+        if (results[id]) return;
+        const text = (a.innerText || '').trim();
+        const lines = text.split('\\n').map(s => s.trim()).filter(Boolean);
+        if (lines.length < 2) return;
+        // 第一行: 时长(00:27), 第二行: 点赞数(28.4万), 第三行: 标题, @开头的行: 作者
+        let duration = lines[0];
+        let likes = 0;
+        if (lines.length >= 2) {
+          const likeStr = lines[1];
+          if (/^\\d+(\\.\\d+)?[万w]?$/.test(likeStr)) {
+            const n = parseFloat(likeStr.replace(/[万w]/g, ''));
+            likes = Math.round((likeStr.includes('万') || likeStr.includes('w') ? n * 10000 : n));
+          }
+        }
+        let title = lines.length >= 3 ? lines[2] : lines[1];
+        let author = '';
+        for (const line of lines) {
+          if (line.startsWith('@')) {
+            author = line.substring(1).trim();
+            break;
+          }
+        }
+        results[id] = {title, author, likes, duration};
       });
-      return Object.keys(seen).map(id => [id, seen[id]]);
+      return Object.entries(results).map(([id, d]) => [id, d.title, d.author, d.likes, d.duration]);
     }
     """
     rows = []
-    for vid, title in page.evaluate(js):
+    for item in page.evaluate(js):
+        vid, title, author, likes, duration = item
         url = f"https://www.douyin.com/video/{vid}"
-        rows.append((url, title))
+        rows.append({"url": url, "title": title, "author": author or "", "likes": int(likes or 0)})
     return rows
 
 
@@ -157,13 +199,13 @@ def _has_captcha(page):
 
 
 def _load_and_extract(page, kw):
-    """打开一个关键词的搜索页，滚动加载，返回 [(url,title)]。"""
-    url = "https://www.douyin.com/search/" + kw + "?type=video"
+    """打开一个关键词的搜索页，按点赞排序，滚动加载，返回 [{url,title,author,likes}]."""
+    url = "https://www.douyin.com/search/" + kw + "?type=video&sort_type=1"
     page.goto(url, wait_until="domcontentloaded", timeout=30000)
-    page.wait_for_timeout(3500)
+    page.wait_for_selector('a[href*="/video/"]', timeout=10000)
     for _ in range(SCROLLS):
         page.mouse.wheel(0, 2400)
-        page.wait_for_timeout(1500)
+        page.wait_for_timeout(800 + random.randint(200, 800))
     return _extract_videos(page)
 
 
@@ -172,7 +214,7 @@ def cmd_search(keywords):
     if not os.path.isdir(PROFILE_DIR):
         print("[search] 还没登录。先跑：.venv/bin/python scrapers/douyin_playwright.py login")
         sys.exit(1)
-    collected = {}  # url -> title
+    collected = {}  # url -> {title, author, likes}
     with sync_playwright() as p:
         ctx = _new_context(p, headless=False)
         if not _logged_in(ctx):
@@ -184,12 +226,10 @@ def cmd_search(keywords):
             rows = []
             try:
                 rows = _load_and_extract(page, kw)
-                # 抓到 0 条多半是撞验证码：轮询最多 60s 等你在窗口手动滑动验证，
-                # 一旦检测到视频卡片出现（说明滑过了）就重新滚动抓取
                 if not rows and _has_captcha(page):
                     print(f"[search] 「{kw}」撞验证码 → 请在弹出的窗口里手动滑动验证，最多等 60s…")
                     solved = False
-                    for _ in range(20):  # 20 × 3s = 60s
+                    for _ in range(20):
                         time.sleep(3)
                         if page.query_selector('a[href*="/video/"]'):
                             solved = True
@@ -198,7 +238,7 @@ def cmd_search(keywords):
                         page.wait_for_timeout(2000)
                         for _ in range(SCROLLS):
                             page.mouse.wheel(0, 2400)
-                            page.wait_for_timeout(1500)
+                            page.wait_for_timeout(800 + random.randint(200, 800))
                         rows = _extract_videos(page)
                         print(f"[search] 「{kw}」验证通过，继续抓取。")
                     else:
@@ -206,12 +246,14 @@ def cmd_search(keywords):
             except Exception as e:
                 print(f"[search] 「{kw}」失败：{e}")
             hit = 0
-            for u, t in rows:
-                if u in collected:
+            for item in rows:
+                url = item["url"]
+                title = item["title"]
+                if url in collected:
                     continue
-                if t and not is_sg(t):
-                    continue  # 有标题但不含新加坡锚点 → 跳过；无标题的保留待人工核实
-                collected[u] = t
+                if title and not is_sg(title):
+                    continue
+                collected[url] = item
                 hit += 1
                 if hit >= PER_KEYWORD:
                     break
@@ -226,6 +268,13 @@ def _norm(s):
     return "".join(ch for ch in (s or "").lower() if ch.isalnum())
 
 
+def _fmt_likes(n):
+    n = int(n or 0)
+    if n >= 10000:
+        return f"{n/10000:.1f}万"
+    return str(n) if n else ""
+
+
 def _merge_output(collected):
     """把新抓到的视频去重合并进 evergreen_input.json（按URL和标题双重去重）。"""
     existing = []
@@ -234,26 +283,45 @@ def _merge_output(collected):
             existing = json.load(f)
     have_url = {r.get("出处链接") for r in existing}
     have_title = {_norm(r.get("话题")) for r in existing}
+    seen_urls = set()
+    if os.path.exists(SEEN_FILE):
+        with open(SEEN_FILE, encoding="utf-8") as f:
+            seen_urls = set(json.load(f))
     added = 0
-    for url, title in collected.items():
-        disp = title or "（抖音视频·标题待人工核实）"
-        if url in have_url or (_norm(disp) in have_title and title):
+    for url, item in collected.items():
+        title = item.get("title", "") or "（抖音视频·标题待人工核实）"
+        if url in have_url or url in seen_urls or (_norm(title) in have_title and item.get("title")):
             continue
+        likes = item.get("likes", 0)
+        author = item.get("author", "")
+        likes_str = _fmt_likes(likes)
+        heat_data_parts = []
+        if likes_str:
+            heat_data_parts.append(f"点赞{likes_str}")
+        if author:
+            heat_data_parts.append(author)
+        heat_data = "·".join(heat_data_parts) if heat_data_parts else "扫码登录抓取·公开视频"
         existing.append({
-            "话题": disp,
-            "类别": classify(disp),
+            "话题": title,
+            "类别": classify(title),
             "平台": "抖音",
-            "热度": "中",
-            "热度数据": "扫码登录抓取·公开视频·需人工核实",
+            "热度": heat_douyin(likes),
+            "热度数据": heat_data,
             "出处链接": url,
+            "点赞数": likes,
+            "作者": author,
+            "采集日期": date.today().isoformat(),
         })
         have_url.add(url)
-        have_title.add(_norm(disp))
+        have_title.add(_norm(title))
+        seen_urls.add(url)
         added += 1
     with open(OUT_FILE, "w", encoding="utf-8") as f:
         json.dump(existing, f, ensure_ascii=False, indent=2)
+    with open(SEEN_FILE, "w", encoding="utf-8") as f:
+        json.dump(sorted(seen_urls), f, ensure_ascii=False)
     print(f"[search] 新增 {added} 条 → {OUT_FILE}（去重后共 {len(existing)} 条）")
-    print("[search] 下一步跑 python3 run.py，把它们写进飞书长期热点库。")
+    print("[search] 下一步跑 python3 run.py，把它们写进飞书。")
 
 
 def main():

@@ -57,6 +57,24 @@ def heat_by_play(n):
     return "低"
 
 
+def heat_douyin(likes):
+    likes = int(likes or 0)
+    if likes >= 100000:
+        return "高"
+    if likes >= 30000:
+        return "中"
+    return "低"
+
+
+def heat_xhs(likes, collects):
+    total = int(likes or 0) + int(collects or 0)
+    if total >= 5000:
+        return "高"
+    if total >= 1000:
+        return "中"
+    return "低"
+
+
 def classify(title):
     t = title or ""
     if any(k in t for k in ["陪读", "低龄", "初中", "初三", "小学", "中学", "AEIS", "插班", "国际学校"]):
@@ -165,7 +183,7 @@ def norm_platform(p):
 
 
 def _load_tier(fname):
-    """读一层输入 json（search_input / evergreen_input），归一平台、盖当日采集日期。"""
+    """读一层输入 json（search_input / evergreen_input），归一平台、保留采集日期。"""
     path = os.path.join(ROOT, "output", fname)
     if not os.path.exists(path):
         return []
@@ -176,17 +194,25 @@ def _load_tier(fname):
         src = r.get("平台", "全网")
         plat = norm_platform(src)
         heat_data = r.get("热度数据", "")
-        # 具体来源名（如"联合早报"）被归入全网时，补进热度数据不丢失
         if plat == "全网" and src and src != "全网" and src not in heat_data:
             heat_data = f"{src}·{heat_data}" if heat_data else src
+        heat = r.get("热度", "中")
+        if plat == "抖音" and r.get("点赞数"):
+            heat = heat_douyin(r["点赞数"])
+        elif plat == "小红书" and (r.get("点赞数") or r.get("收藏数")):
+            heat = heat_xhs(r.get("点赞数", 0), r.get("收藏数", 0))
+        # 保留采集器写入的采集日期，没有则标今天
+        col_date = r.get("采集日期", "")
+        if not col_date:
+            col_date = TODAY + " 00:00:00"
         rows.append({
             "话题": r.get("话题", ""),
             "类别": r.get("类别", "综合话题"),
             "平台": plat,
-            "热度": r.get("热度", "中"),
+            "热度": heat,
             "热度数据": heat_data,
             "出处链接": r.get("出处链接", ""),
-            "采集日期": TODAY + " 00:00:00",
+            "采集日期": col_date,
         })
     return rows
 
@@ -319,14 +345,16 @@ def _batch_create(base_token, table, rows):
 
 
 def write_daily(rows, cfg):
-    """当天日期表：清空重写，当天反复跑不重复。"""
+    """当天日期表：追加写入，同一天反复跑自动去重。"""
     base_token = cfg["feishu"]["base_token"]
     table = TODAY
     if not ensure_table(base_token, table):
         return False
-    if not clear_table(base_token, table):
-        return False
-    return _batch_create(base_token, table, rows)
+    have = _existing_topics(base_token, table)
+    new = [r for r in rows if norm(r["话题"]) not in have]
+    if not new:
+        return True
+    return _batch_create(base_token, table, new)
 
 
 def _existing_topics(base_token, table):
@@ -373,16 +401,21 @@ def main():
     heat_rank = {"高": 0, "中": 1, "低": 2}
     plat_rank = {"全网": 0, "微博": 1, "知乎": 2, "虎扑": 3, "小红书": 4, "抖音": 5, "B站": 6}
 
-    # 当天看板：只放能确认时效的（全网新闻带日期 + 微博带日期 + B站近120天带发布日期）。
-    # 抖音/小红书是 WebSearch 索引的存量内容、无法判定时效，只进长期库当人工搜索池，不污染当天表。
+    # 当天看板：全网新闻 + 微博 + B站近120天 + 今天采集的抖音/小红书
     pool = load_evergreen_tier()
     search_rows = load_search_tier()
     fresh_bili, ever_bili = collect_bilibili(keywords)
-    daily_rows = dedup(search_rows + fresh_bili)
+
+    # 只取今天采集的条目进当天看板
+    today_prefix = TODAY
+    fresh_pool = [r for r in pool if r.get("采集日期", "").startswith(today_prefix)]
+    ever_pool = [r for r in pool if r not in fresh_pool]
+
+    daily_rows = dedup(search_rows + fresh_bili + fresh_pool)
     daily_rows.sort(key=lambda r: (heat_rank.get(r["热度"], 9), plat_rank.get(r["平台"], 9)))
 
-    # 长期库：B站历史高播放 + 抖音/小红书公开话题池（追加去重、不清空）
-    evergreen_rows = dedup(ever_bili + pool)
+    # 长期库：B站历史高播放 + 抖音/小红书旧格式条目（追加去重、不清空）
+    evergreen_rows = dedup(ever_bili + ever_pool)
     evergreen_rows.sort(key=lambda r: (heat_rank.get(r["热度"], 9), plat_rank.get(r["平台"], 9)))
 
     md_path, csv_path = write_local(daily_rows)
@@ -412,6 +445,23 @@ def main():
         print(f"已写飞书「{EVERGREEN_TABLE}」表（本次新增 {ev_new} 条）")
     else:
         print("长期库写入未完成，见上方错误。")
+
+    # 推送摘要到飞书群聊
+    push_chat_id = cfg.get("feishu", {}).get("push_chat_id")
+    if push_chat_id and ok:
+        from collections import Counter
+        pc = Counter(r["平台"] for r in daily_rows)
+        plat_brief = " ".join(f"{k}{v}" for k, v in sorted(pc.items(), key=lambda x: plat_rank.get(x[0], 9)))
+        heat_pc = Counter(r["热度"] for r in daily_rows)
+        msg = (f"📡 新加坡热点雷达 · {TODAY}\n"
+               f"当天看板：{len(daily_rows)} 条（{plat_brief}）\n"
+               f"热度分布：高{heat_pc.get('高',0)} 中{heat_pc.get('中',0)} 低{heat_pc.get('低',0)}\n"
+               f"长期库新增：{ev_new} 条\n"
+               f"看板链接：{base_url}")
+        subprocess.run(["lark-cli", "im", "+messages-send",
+                        "--chat-id", push_chat_id, "--text", msg],
+                       capture_output=True, text=True)
+        print(f"\n已推送群聊摘要。")
 
 
 if __name__ == "__main__":
