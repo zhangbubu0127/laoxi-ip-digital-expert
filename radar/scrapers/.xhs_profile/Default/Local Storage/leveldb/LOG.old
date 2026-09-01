@@ -1,3 +1,5 @@
-2026/08/22-09:40:30.715 32f444b Reusing MANIFEST /Users/User/Desktop/老席留学ip数字专家/radar/scrapers/.xhs_profile/Default/Local Storage/leveldb/MANIFEST-000001
-2026/08/22-09:40:30.721 32f444b Recovering log #17
-2026/08/22-09:40:30.721 32f444b Reusing old log /Users/User/Desktop/老席留学ip数字专家/radar/scrapers/.xhs_profile/Default/Local Storage/leveldb/000017.log 
+2026/08/26-10:28:59.753 366dd1a Reusing MANIFEST /Users/User/Desktop/老席留学ip数字专家/radar/scrapers/.xhs_profile/Default/Local Storage/leveldb/MANIFEST-000001
+2026/08/26-10:28:59.756 366dd1a Recovering log #17
+2026/08/26-10:28:59.756 366dd1a Level-0 table #20: started
+2026/08/26-10:28:59.759 366dd1a Level-0 table #20: 44452 bytes OK
+2026/08/26-10:28:59.761 366dd1a Delete type=0 #17

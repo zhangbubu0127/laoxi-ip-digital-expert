@@ -1,5 +1,15 @@
-2026/08/26-10:28:59.753 366dd1a Reusing MANIFEST /Users/User/Desktop/老席留学ip数字专家/radar/scrapers/.xhs_profile/Default/Local Storage/leveldb/MANIFEST-000001
-2026/08/26-10:28:59.756 366dd1a Recovering log #17
-2026/08/26-10:28:59.756 366dd1a Level-0 table #20: started
-2026/08/26-10:28:59.759 366dd1a Level-0 table #20: 44452 bytes OK
-2026/08/26-10:28:59.761 366dd1a Delete type=0 #17
+2026/08/28-14:13:54.549 38eac8b Reusing MANIFEST /Users/User/Desktop/老席留学ip数字专家/radar/scrapers/.xhs_profile/Default/Local Storage/leveldb/MANIFEST-000001
+2026/08/28-14:13:54.552 38eac8b Recovering log #21
+2026/08/28-14:13:54.552 38eac8b Reusing old log /Users/User/Desktop/老席留学ip数字专家/radar/scrapers/.xhs_profile/Default/Local Storage/leveldb/000021.log 
+2026/08/28-14:22:56.163 38eac90 Level-0 table #24: started
+2026/08/28-14:22:56.168 38eac90 Level-0 table #24: 43122 bytes OK
+2026/08/28-14:22:56.173 38eac90 Delete type=0 #21
+2026/08/28-14:22:56.178 38eac90 Compacting 4@0 + 1@1 files
+2026/08/28-14:22:56.180 38eac90 Generated table #25@0: 26 keys, 26456 bytes
+2026/08/28-14:22:56.180 38eac90 Compacted 4@0 + 1@1 files => 26456 bytes
+2026/08/28-14:22:56.181 38eac90 compacted to: files[ 0 1 0 0 0 0 0 ]
+2026/08/28-14:22:56.181 38eac90 Delete type=2 #15
+2026/08/28-14:22:56.181 38eac90 Delete type=2 #13
+2026/08/28-14:22:56.181 38eac90 Delete type=2 #20
+2026/08/28-14:22:56.181 38eac90 Delete type=2 #18
+2026/08/28-14:22:56.181 38eac90 Delete type=2 #24
